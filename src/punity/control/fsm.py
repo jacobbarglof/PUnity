@@ -11,6 +11,8 @@ class ControlConfig:
     min_confidence: float
     require_open_palm: bool
     hotkey_cooldown_ms: int
+    pinch_click_cooldown_ms: int = 200
+    scroll_repeat_ms: int = 80
 
 
 @dataclass
@@ -21,6 +23,8 @@ class ControlFSM:
     _mouse_down: bool = False
     _last_label: GestureLabel = GestureLabel.NONE
     _last_hotkey_ms: dict[str, int] = field(default_factory=dict)
+    _last_pinch_click_ms: int = -10000
+    _last_scroll_emit_ms: int = -10000
 
     def set_active(self, active: bool) -> None:
         self.active = active
@@ -60,7 +64,7 @@ class ControlFSM:
             return events
 
         if self.config.require_open_palm:
-            can_point = gesture.label in (GestureLabel.OPEN_PALM, GestureLabel.PINCHING)
+            can_point = gesture.label in (GestureLabel.POINTER, GestureLabel.PINCHING, GestureLabel.PINKY_DRAG)
         else:
             can_point = gesture.label != GestureLabel.FIST
 
@@ -73,7 +77,8 @@ class ControlFSM:
             )
             self.state = AppState.POINTING
 
-        if gesture.label == GestureLabel.PINCHING:
+        # Pinky gesture drives click-and-hold drag.
+        if gesture.label == GestureLabel.PINKY_DRAG:
             if not self._mouse_down:
                 self._mouse_down = True
                 events.append(ControlEvent(event_type=EventType.MOUSE_DOWN_LEFT))
@@ -85,6 +90,21 @@ class ControlFSM:
                 self.state = AppState.POINTING
             else:
                 self.state = AppState.ARMED
+
+        # Pinch is a debounced click (not hold).
+        pinch_edge = gesture.label == GestureLabel.PINCHING and self._last_label != GestureLabel.PINCHING
+        if pinch_edge and (t_ms - self._last_pinch_click_ms) >= self.config.pinch_click_cooldown_ms:
+            events.append(ControlEvent(event_type=EventType.MOUSE_DOWN_LEFT))
+            events.append(ControlEvent(event_type=EventType.MOUSE_UP_LEFT))
+            self._last_pinch_click_ms = t_ms
+
+        # Scroll gesture repeats while pose is held.
+        if gesture.label in (GestureLabel.SCROLL_UP, GestureLabel.SCROLL_DOWN):
+            if t_ms - self._last_scroll_emit_ms >= self.config.scroll_repeat_ms:
+                dy = 2 if gesture.label == GestureLabel.SCROLL_UP else -2
+                events.append(ControlEvent(event_type=EventType.SCROLL, payload={"dx": 0, "dy": dy}))
+                self._last_scroll_emit_ms = t_ms
+            self.state = AppState.COMMAND
 
         self._emit_mapped_action(events, gesture.label, t_ms, mappings)
 

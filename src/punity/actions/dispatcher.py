@@ -46,6 +46,7 @@ class CursorConfig:
     sensitivity: float
     accel: float
     deadzone_px: float
+    edge_padding_px: float
 
 
 class ActionDispatcher:
@@ -72,6 +73,13 @@ class ActionDispatcher:
             self._mouse.release(Button.left)
             return
 
+        if event.event_type == EventType.SCROLL:
+            dx = int(event.payload.get("dx", 0))
+            dy = int(event.payload.get("dy", 0))
+            if dx != 0 or dy != 0:
+                self._mouse.scroll(dx, dy)
+            return
+
         if event.event_type == EventType.HOTKEY:
             keys = event.payload.get("keys", [])
             if isinstance(keys, list):
@@ -80,8 +88,14 @@ class ActionDispatcher:
     def _move_cursor(self, point_norm: tuple[float, float]) -> None:
         nx = max(0.0, min(1.0, float(point_norm[0])))
         ny = max(0.0, min(1.0, float(point_norm[1])))
-        target_x = int(nx * (self._screen_w - 1))
-        target_y = int(ny * (self._screen_h - 1))
+
+        # Overscan padding makes screen edges easier to reach without extreme hand motion.
+        edge_pad = max(0.0, float(self._cursor_config.edge_padding_px))
+        pad_x = min(edge_pad, (self._screen_w - 1) / 2.0)
+        pad_y = min(edge_pad, (self._screen_h - 1) / 2.0)
+
+        target_x = int((-pad_x) + nx * ((self._screen_w - 1) + 2.0 * pad_x))
+        target_y = int((-pad_y) + ny * ((self._screen_h - 1) + 2.0 * pad_y))
 
         curr_x, curr_y = self._mouse.position
         dx = target_x - curr_x

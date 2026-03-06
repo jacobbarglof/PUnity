@@ -4,14 +4,15 @@
     "pinch_off": 0.5,
     "min_confidence": 0.65,
     "min_detection_confidence": 0.72,
-    "min_tracking_confidence": 0.62
+    "min_tracking_confidence": 0.3
   },
   "cursor": {
     "sensitivity": 0.16,
-    "accel": 0.32,
-    "smoothing": 0.14,
+    "accel": 0.01,
+    "smoothing": 0.01,
     "filter": "one_euro",
-    "deadzone_px": 0.1
+    "deadzone_px": 0.1,
+    "edge_padding_px": 80.0
   },
   "safety": {
     "kill_switch_key": "f8",
