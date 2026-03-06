@@ -14,34 +14,46 @@ PUnity is a Windows 11 desktop app that tracks one hand from a webcam and turns 
   - Confidence gating
 - JSON profile configuration for thresholds, smoothing, mappings, and safety
 - OpenCV overlay HUD for state, gesture, confidence, and FPS
+- Tron-style control GUI (`punity-gui`) with:
+  - gesture toolbar (what/how/action)
+  - command panel
+  - profile manager + settings editor
+  - start/stop engine controls + runtime log
 
 ## Python version requirement
 
-Use Python **3.11 or 3.12** and pin MediaPipe to **<=0.10.21** because newer releases removed `mp.solutions` used by this app.
+Use Python **3.12.x** and pin MediaPipe to **<=0.10.21** because newer releases removed `mp.solutions` used by this app.
 
-If you currently created your venv with Python 3.14, recreate it with Python 3.12:
+## Install
+
+Recommended (always builds with Python 3.12 and recreates `.venv`):
 
 ```powershell
 # From C:\Programs\PUnity
-Deactivate 2>$null
-Remove-Item -Recurse -Force .venv
+.\scripts\bootstrap.ps1
+```
+
+Manual equivalent:
+
+```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install --upgrade pip setuptools wheel
 pip install -e .
 ```
-## Install
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
-```
 
 ## Run
 
+Core engine (overlay only):
+
 ```powershell
 punity --profile profiles/default.json
+```
+
+Tron GUI controller:
+
+```powershell
+punity-gui
 ```
 
 - Press `F8` to toggle active/pause instantly.
@@ -91,6 +103,7 @@ src/punity/
   actions/dispatcher.py
   config/profile.py
   ui/overlay.py
+  ui/tron_gui.py
   app.py
 ```
 
@@ -98,5 +111,3 @@ src/punity/
 
 - This project injects inputs at user level through `pynput`.
 - For stricter injection behavior, add a Windows `SendInput` backend later under `actions/win_sendinput.py` and switch dispatcher wiring.
-
-

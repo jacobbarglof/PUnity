@@ -157,10 +157,10 @@ def _key_matches(key, token: str) -> bool:
 
 
 def _ensure_supported_python() -> None:
-    if sys.version_info >= (3, 13):
+    if sys.version_info < (3, 12) or sys.version_info >= (3, 13):
         ver = f"{sys.version_info.major}.{sys.version_info.minor}"
         raise RuntimeError(
-            f"Python {ver} detected. PUnity currently requires Python 3.11 or 3.12 for MediaPipe Hands support."
+            f"Python {ver} detected. PUnity requires Python 3.12.x for MediaPipe Hands support."
         )
 
 
@@ -184,4 +184,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
