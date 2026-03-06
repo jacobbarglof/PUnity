@@ -1,0 +1,5 @@
+opencv-python>=4.10.0
+mediapipe>=0.10.14,<=0.10.21
+pynput>=1.7.7
+
+

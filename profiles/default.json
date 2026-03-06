@@ -1,0 +1,49 @@
+{
+  "thresholds": {
+    "pinch_on": 0.52,
+    "pinch_off": 0.67,
+    "min_confidence": 0.65,
+    "min_detection_confidence": 0.72,
+    "min_tracking_confidence": 0.62
+  },
+  "cursor": {
+    "sensitivity": 0.56,
+    "accel": 0.32,
+    "smoothing": 0.34,
+    "filter": "one_euro",
+    "deadzone_px": 3
+  },
+  "safety": {
+    "kill_switch_key": "f8",
+    "idle_timeout_ms": 4000,
+    "require_open_palm": true
+  },
+  "swipe": {
+    "enabled": true,
+    "velocity_threshold": 1.7,
+    "cooldown_ms": 850
+  },
+  "camera": {
+    "device_index": 0,
+    "width": 1280,
+    "height": 720,
+    "fps": 60
+  },
+  "overlay": {
+    "enabled": true,
+    "mirror_preview": true
+  },
+  "mappings": {
+    "SWIPE_LEFT": {
+      "event": "HOTKEY",
+      "keys": ["cmd", "ctrl", "left"],
+      "cooldown_ms": 1200
+    },
+    "SWIPE_RIGHT": {
+      "event": "HOTKEY",
+      "keys": ["cmd", "ctrl", "right"],
+      "cooldown_ms": 1200
+    }
+  }
+}
+

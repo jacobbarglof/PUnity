@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "punity"
+version = "0.1.0"
+description = "Reliable webcam hand gestures for Windows 11 input control"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+authors = [{ name = "PUnity" }]
+dependencies = [
+    "opencv-python>=4.10.0",
+    "mediapipe>=0.10.14,<=0.10.21",
+    "pynput>=1.7.7",
+]
+
+[project.scripts]
+punity = "punity.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
