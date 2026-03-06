@@ -10,6 +10,7 @@ class GestureLabel(str, Enum):
     OPEN_PALM = "OPEN_PALM"
     PINCHING = "PINCHING"
     FIST = "FIST"
+    FINGERS_CROSSED = "FINGERS_CROSSED"
     SWIPE_LEFT = "SWIPE_LEFT"
     SWIPE_RIGHT = "SWIPE_RIGHT"
 

@@ -52,15 +52,22 @@ class GestureRecognizer:
         elif pinch_dist <= self._config.pinch_on:
             self._pinching = True
 
-        can_swipe = features.is_open_palm and not self._pinching and not features.is_fist
+        can_swipe = (
+            features.is_open_palm
+            and not self._pinching
+            and not features.is_fist
+            and not features.is_fingers_crossed
+        )
 
         swipe = None
         if self._config.swipe_enabled:
             swipe = self._detect_swipe(features.cursor_point_norm, t_ms, can_swipe)
 
-        # Prioritize FIST over PINCHING so a closed hand is always an immediate stop signal.
+        # Priority order for deterministic control: crossed toggle > fist safety > pinch > open.
         label = GestureLabel.NONE
-        if features.is_fist:
+        if features.is_fingers_crossed:
+            label = GestureLabel.FINGERS_CROSSED
+        elif features.is_fist:
             label = GestureLabel.FIST
         elif self._pinching:
             label = GestureLabel.PINCHING
@@ -102,7 +109,7 @@ class GestureRecognizer:
         vx = dx / dt_s
         vy = dy / dt_s
 
-        alpha = min(1.0, dt_ms / 45.0)
+        alpha = min(1.0, dt_ms / 30.0)
         self._smoothed_vx = (1.0 - alpha) * self._smoothed_vx + alpha * vx
 
         self._last_swipe_point = point
@@ -118,16 +125,18 @@ class GestureRecognizer:
 
         disp_x = point[0] - self._swipe_anchor[0]
 
-        if t_ms - self._last_swipe_ms < self._config.swipe_cooldown_ms:
+        effective_cooldown = max(200, int(self._config.swipe_cooldown_ms * 0.6))
+        if t_ms - self._last_swipe_ms < effective_cooldown:
             return None
 
-        if abs(disp_x) < 0.10:
+        if abs(disp_x) < 0.04:
             return None
 
-        if abs(self._smoothed_vx) < self._config.swipe_velocity_threshold:
+        required_v = max(0.30, self._config.swipe_velocity_threshold * 0.45)
+        if abs(self._smoothed_vx) < required_v:
             return None
 
-        if abs(vy) > abs(self._smoothed_vx) * 0.8:
+        if abs(vy) > abs(self._smoothed_vx) * 1.5:
             return None
 
         self._last_swipe_ms = t_ms

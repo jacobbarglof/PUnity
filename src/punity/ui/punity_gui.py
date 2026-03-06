@@ -30,6 +30,7 @@ from punity.config.profile import (
 )
 from punity.control.fsm import ControlConfig, ControlFSM
 from punity.gestures.recognizer import GestureConfig, GestureRecognizer
+from punity.models import GestureLabel
 from punity.tracking.filters import EMAFilter2D, OneEuroFilter2D
 from punity.tracking.hand_state import HandStateTracker
 from punity.ui.overlay import draw_hand_skeleton
@@ -83,6 +84,7 @@ GESTURE_GUIDE: tuple[tuple[str, str, str], ...] = (
     ("OPEN_PALM", "Spread fingers and face palm to camera", "Enable pointing + move cursor"),
     ("PINCHING", "Touch thumb tip to index tip", "Mouse down and drag while held"),
     ("FIST", "Curl all fingers in", "Immediate pause and drag release"),
+    ("FINGERS_CROSSED", "Cross index and middle fingers", "Toggle pause/resume controls"),
     ("SWIPE_LEFT", "Quick horizontal sweep to left", "Mapped command action"),
     ("SWIPE_RIGHT", "Quick horizontal sweep to right", "Mapped command action"),
 )
@@ -259,11 +261,11 @@ class PUnityRuntimeEngine:
         with self._config_lock:
             return json.loads(json.dumps(self._profile_dict)), self._profile_version
 
-    def _toggle_active(self) -> None:
+    def _toggle_active(self, source: str = "Kill switch") -> None:
         with self._active_lock:
             self._active = not self._active
             state = "ACTIVE" if self._active else "PAUSED"
-            self._log_queue.put(f"Kill switch toggled -> {state}")
+            self._log_queue.put(f"{source} toggled -> {state}")
 
     def _is_active(self) -> bool:
         with self._active_lock:
@@ -273,12 +275,12 @@ class PUnityRuntimeEngine:
         token = self._kill_switch_token
         if len(token) == 1:
             if getattr(key, "char", "") == token:
-                self._toggle_active()
+                self._toggle_active("Kill switch")
             return
 
         key_name = token if token.startswith("Key.") else f"Key.{token}"
         if str(key) == key_name:
-            self._toggle_active()
+            self._toggle_active("Kill switch")
 
     def _push_frame(self, frame_bgr) -> None:
         try:
@@ -317,7 +319,8 @@ class PUnityRuntimeEngine:
         profile_version = 0
         fps = 0.0
         last_t = time.monotonic()
-        target_loop_hz = 75.0
+        target_loop_hz = 30.0
+        crossed_latch = False
 
         from punity.perception.hands import HandsDetector
 
@@ -331,7 +334,7 @@ class PUnityRuntimeEngine:
             if detector is not None:
                 detector.close()
 
-            target_loop_hz = float(max(45, min(90, parsed.camera.fps)))
+            target_loop_hz = float(max(5, min(90, parsed.camera.fps)))
 
             camera = CameraCapture(
                 CameraConfig(
@@ -397,7 +400,6 @@ class PUnityRuntimeEngine:
             profile = rebuild_pipeline(raw_profile)
 
             while not self._stop_event.is_set():
-                loop_start = time.monotonic()
 
                 raw_profile, next_ver = self._read_profile_snapshot()
                 if next_ver != profile_version:
@@ -417,10 +419,23 @@ class PUnityRuntimeEngine:
                 if profile.overlay.mirror_preview:
                     frame_bgr = cv2.flip(frame_bgr, 1)
 
-                frame_rgb = detector.bgr_to_rgb(frame_bgr)
+                detect_bgr = frame_bgr
+                frame_h, frame_w = frame_bgr.shape[:2]
+                if frame_w > 640:
+                    detect_h = max(1, int(frame_h * (640.0 / frame_w)))
+                    detect_bgr = cv2.resize(frame_bgr, (640, detect_h), interpolation=cv2.INTER_LINEAR)
+
+                frame_rgb = detector.bgr_to_rgb(detect_bgr)
                 observation = detector.detect(frame_rgb, t_ms)
 
                 gesture = recognizer.recognize(observation, t_ms)
+                if gesture.label == GestureLabel.FINGERS_CROSSED:
+                    if not crossed_latch:
+                        self._toggle_active("Fingers crossed")
+                    crossed_latch = True
+                else:
+                    crossed_latch = False
+
                 if gesture.cursor_point_norm is not None:
                     gesture.cursor_point_norm = cursor_filter.update(gesture.cursor_point_norm)
                 else:
@@ -469,10 +484,7 @@ class PUnityRuntimeEngine:
                     }
                 )
 
-                target_dt = 1.0 / target_loop_hz
-                remaining = target_dt - (time.monotonic() - loop_start)
-                if remaining > 0:
-                    time.sleep(remaining)
+
 
         except Exception as exc:
             self._log_queue.put(f"Engine error: {exc}")
@@ -515,8 +527,8 @@ class PUnityControlApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("PUnity Control Console")
-        self.geometry("1600x900")
-        self.minsize(1280, 720)
+        self.geometry("1920x1080")
+        self.minsize(1440, 810)
         self.configure(bg=self.BG)
 
         self._profile_data: dict[str, Any] = {}
@@ -532,6 +544,7 @@ class PUnityControlApp(tk.Tk):
         self._body: tk.Frame | None = None
         self._left_col: tk.Frame | None = None
         self._right_col: tk.Frame | None = None
+        self._mousewheel_canvas: tk.Canvas | None = None
 
         self.profile_name_var = tk.StringVar(value="default.json")
         self.runtime_status_var = tk.StringVar(value="IDLE")
@@ -551,7 +564,7 @@ class PUnityControlApp(tk.Tk):
         self._load_profile_into_editor(self.profile_name_var.get())
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(16, self._poll_runtime)
+        self.after(10, self._poll_runtime)
         self.after(50, lambda: _apply_dark_title_bar(self))
     def _configure_ttk(self) -> None:
         style = ttk.Style()
@@ -561,10 +574,24 @@ class PUnityControlApp(tk.Tk):
             fieldbackground=self.PANEL_ALT,
             background=self.PANEL_ALT,
             foreground=self.TEXT,
+            arrowcolor=self.ACCENT,
             bordercolor=self.ACCENT,
             lightcolor=self.ACCENT,
             darkcolor=self.ACCENT,
         )
+        style.map(
+            "PUnity.TCombobox",
+            fieldbackground=[("readonly", self.PANEL_ALT)],
+            foreground=[("readonly", self.TEXT)],
+            background=[("readonly", self.PANEL_ALT)],
+            selectbackground=[("readonly", self.PANEL_ALT)],
+            selectforeground=[("readonly", self.TEXT)],
+        )
+        # Avoid default white dropdown listbox overlay.
+        self.option_add("*TCombobox*Listbox.background", self.PANEL_ALT)
+        self.option_add("*TCombobox*Listbox.foreground", self.TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", "#123049")
+        self.option_add("*TCombobox*Listbox.selectForeground", self.TEXT)
 
     def _build_layout(self) -> None:
         header = tk.Frame(self, bg=self.BG)
@@ -635,15 +662,15 @@ class PUnityControlApp(tk.Tk):
 
         self._body = tk.Frame(self, bg=self.BG)
         self._body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        self._body.grid_columnconfigure(0, weight=3)
-        self._body.grid_columnconfigure(1, weight=2)
+        self._body.grid_columnconfigure(0, weight=4)
+        self._body.grid_columnconfigure(1, weight=3)
         self._body.grid_rowconfigure(0, weight=1)
 
         self._left_col = tk.Frame(self._body, bg=self.BG)
         self._left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self._left_col.grid_rowconfigure(0, weight=4)
+        self._left_col.grid_rowconfigure(0, weight=10)
         self._left_col.grid_rowconfigure(1, weight=1)
-        self._left_col.grid_rowconfigure(2, weight=2)
+        self._left_col.grid_rowconfigure(2, weight=0)
         self._left_col.grid_columnconfigure(0, weight=1)
 
         preview_panel = self._make_panel(self._left_col, "LIVE CAMERA")
@@ -679,7 +706,7 @@ class PUnityControlApp(tk.Tk):
             bd=0,
             relief="flat",
             wrap="word",
-            height=14,
+            height=6,
         )
         self.logs_text.pack(fill="both", expand=True)
         self.logs_text.configure(state="disabled")
@@ -789,31 +816,44 @@ class PUnityControlApp(tk.Tk):
             self._gesture_action_labels[name] = action_label
 
     def _build_hud_panel(self, parent: tk.Frame) -> None:
-        for row, (key, label) in enumerate(HUD_FIELDS):
-            tk.Label(
-                parent,
-                text=label,
-                bg=self.PANEL,
-                fg=self.TEXT,
-                font=("Consolas", 10),
-                anchor="w",
-            ).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=2)
+        row = tk.Frame(parent, bg=self.PANEL)
+        row.pack(fill="x", expand=True)
+
+        for col, (key, label) in enumerate(HUD_FIELDS):
+            card = tk.Frame(
+                row,
+                bg=self.PANEL_ALT,
+                highlightthickness=1,
+                highlightbackground=self.ACCENT,
+                bd=0,
+                padx=6,
+                pady=4,
+            )
+            card.grid(
+                row=0,
+                column=col,
+                sticky="nsew",
+                padx=(0, 6 if col < len(HUD_FIELDS) - 1 else 0),
+            )
+            row.grid_columnconfigure(col, weight=1, uniform="hud")
 
             tk.Label(
-                parent,
+                card,
+                text=label,
+                bg=self.PANEL_ALT,
+                fg=self.TEXT,
+                font=("Consolas", 8),
+                anchor="w",
+            ).pack(anchor="w")
+
+            tk.Label(
+                card,
                 textvariable=self.hud_vars[key],
                 bg=self.PANEL_ALT,
                 fg=self.ACCENT_SOFT,
-                font=("Consolas", 10, "bold"),
+                font=("Consolas", 9, "bold"),
                 anchor="w",
-                padx=8,
-                pady=2,
-                relief="flat",
-                highlightthickness=1,
-                highlightbackground=self.ACCENT,
-            ).grid(row=row, column=1, sticky="ew", pady=2)
-
-        parent.grid_columnconfigure(1, weight=1)
+            ).pack(anchor="w", pady=(2, 0))
 
     def _build_profile_manager(self, parent: tk.Frame) -> None:
         row = tk.Frame(parent, bg=self.PANEL)
@@ -846,8 +886,38 @@ class PUnityControlApp(tk.Tk):
         self._make_button(actions, "Save As", self._on_save_as_profile).pack(side="left")
 
     def _build_settings_editor(self, parent: tk.Frame) -> None:
-        grid = tk.Frame(parent, bg=self.PANEL)
-        grid.pack(fill="both", expand=True)
+        canvas = tk.Canvas(
+            parent,
+            bg=self.PANEL,
+            bd=0,
+            highlightthickness=0,
+            relief="flat",
+        )
+        scrollbar = tk.Scrollbar(
+            parent,
+            orient="vertical",
+            command=canvas.yview,
+            bg=self.PANEL_ALT,
+            troughcolor=self.PANEL,
+            activebackground="#123049",
+        )
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        grid = tk.Frame(canvas, bg=self.PANEL)
+        grid_window = canvas.create_window((0, 0), window=grid, anchor="nw")
+
+        def _sync_scrollregion(_event=None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_canvas_width(event) -> None:
+            canvas.itemconfigure(grid_window, width=event.width)
+
+        grid.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_canvas_width)
+        canvas.bind("<Enter>", lambda _e: self._bind_mousewheel(canvas))
+        canvas.bind("<Leave>", lambda _e: self._unbind_mousewheel())
 
         for row_idx, field in enumerate(SETTINGS_FIELDS):
             tk.Label(
@@ -895,6 +965,31 @@ class PUnityControlApp(tk.Tk):
             self._field_vars[(field.section, field.key)] = var
 
         grid.grid_columnconfigure(1, weight=1)
+        _sync_scrollregion()
+
+    def _bind_mousewheel(self, canvas: tk.Canvas) -> None:
+        self._mousewheel_canvas = canvas
+        self.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.bind_all("<Button-4>", self._on_mousewheel)
+        self.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _unbind_mousewheel(self) -> None:
+        self._mousewheel_canvas = None
+        self.unbind_all("<MouseWheel>")
+        self.unbind_all("<Button-4>")
+        self.unbind_all("<Button-5>")
+
+    def _on_mousewheel(self, event) -> None:
+        if self._mousewheel_canvas is None:
+            return
+        if hasattr(event, "delta") and event.delta:
+            self._mousewheel_canvas.yview_scroll(int(-event.delta / 120), "units")
+            return
+        if getattr(event, "num", None) == 4:
+            self._mousewheel_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self._mousewheel_canvas.yview_scroll(1, "units")
+
     def _refresh_profile_list(self) -> None:
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
         names = sorted(path.name for path in PROFILES_DIR.glob("*.json"))
@@ -1135,8 +1230,8 @@ class PUnityControlApp(tk.Tk):
 
         self._left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self._right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        self._body.grid_columnconfigure(0, weight=3)
-        self._body.grid_columnconfigure(1, weight=2)
+        self._body.grid_columnconfigure(0, weight=4)
+        self._body.grid_columnconfigure(1, weight=3)
 
     def _poll_runtime(self) -> None:
         while True:
@@ -1170,7 +1265,7 @@ class PUnityControlApp(tk.Tk):
             self._engine = None
             self._set_runtime_status("IDLE", good=False)
 
-        self.after(16, self._poll_runtime)
+        self.after(10, self._poll_runtime)
 
     def _render_preview(self, frame_bgr) -> None:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -1190,6 +1285,11 @@ class PUnityControlApp(tk.Tk):
     def _append_log(self, line: str) -> None:
         self.logs_text.configure(state="normal")
         self.logs_text.insert(tk.END, line + "\n")
+
+        line_count = int(float(self.logs_text.index("end-1c").split(".")[0]))
+        if line_count > 220:
+            self.logs_text.delete("1.0", f"{line_count - 220}.0")
+
         self.logs_text.see(tk.END)
         self.logs_text.configure(state="disabled")
 

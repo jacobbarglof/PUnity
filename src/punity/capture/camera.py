@@ -12,7 +12,7 @@ class CameraConfig:
     device_index: int = 0
     width: int = 1280
     height: int = 720
-    fps: int = 75
+    fps: int = 30
 
 
 class CameraCapture:
@@ -30,12 +30,21 @@ class CameraCapture:
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._config.height)
         self._cap.set(cv2.CAP_PROP_FPS, self._config.fps)
 
+        # Reduce capture queue depth to limit stale-frame latency on webcams.
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # Prefer MJPG where available; many UVC webcams deliver it with lower decode overhead.
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        self._cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+
     def read_frame(self) -> tuple[Any, int]:
         if self._cap is None or not self._cap.isOpened():
             self._open()
 
         assert self._cap is not None
+
         ok, frame = self._cap.read()
+
         if not ok:
             self._open()
             ok, frame = self._cap.read()
@@ -49,5 +58,3 @@ class CameraCapture:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
-
-

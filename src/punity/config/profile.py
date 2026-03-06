@@ -42,7 +42,7 @@ class CameraProfile:
     device_index: int = 0
     width: int = 1280
     height: int = 720
-    fps: int = 75
+    fps: int = 30
 
 
 @dataclass(slots=True)
@@ -105,6 +105,3 @@ def load_profile(path: str | Path) -> AppProfile:
         overlay=OverlayProfile(**merged["overlay"]),
         mappings=merged.get("mappings", {}),
     )
-
-
-

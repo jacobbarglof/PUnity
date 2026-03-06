@@ -25,6 +25,7 @@ class GestureFeatures:
     finger_extended: dict[str, bool]
     is_open_palm: bool
     is_fist: bool
+    is_fingers_crossed: bool
     palm_scale: float
     cursor_point_norm: tuple[float, float]
     hand_center_norm: tuple[float, float]
@@ -59,13 +60,15 @@ def compute_features(obs: HandObservation) -> GestureFeatures:
 
     thumb = lm[THUMB_TIP]
     index = lm[INDEX_TIP]
+    middle = lm[MIDDLE_TIP]
     pinch_distance = _distance_2d(thumb.x, thumb.y, index.x, index.y)
     pinch_distance_norm = pinch_distance / palm_scale
     pinch_strength = 1.0 - _clamp((pinch_distance_norm - 0.20) / 0.5, 0.0, 1.0)
 
-    # Landmark IDs: thumb_mcp=2, index_mcp=5.
+    # Landmark IDs: thumb_mcp=2, index_mcp=5, middle_mcp=9.
     thumb_mcp = lm[2]
     index_mcp = lm[5]
+    middle_mcp = lm[9]
     thumb_tip_to_wrist = _distance_2d(thumb.x, thumb.y, wrist.x, wrist.y)
     thumb_mcp_to_wrist = _distance_2d(thumb_mcp.x, thumb_mcp.y, wrist.x, wrist.y)
     thumb_tip_to_index_mcp = _distance_2d(thumb.x, thumb.y, index_mcp.x, index_mcp.y)
@@ -78,6 +81,19 @@ def compute_features(obs: HandObservation) -> GestureFeatures:
     middle_extended = _finger_is_extended(obs, MIDDLE_TIP, MIDDLE_PIP)
     ring_extended = _finger_is_extended(obs, RING_TIP, RING_PIP)
     pinky_extended = _finger_is_extended(obs, PINKY_TIP, PINKY_PIP)
+
+    # Fingers-crossed: index+middle extended, tips close, and their tip ordering swaps
+    # compared to MCP ordering across the hand.
+    index_middle_tip_dist_norm = _distance_2d(index.x, index.y, middle.x, middle.y) / palm_scale
+    mcp_order = index_mcp.x - middle_mcp.x
+    tip_order = index.x - middle.x
+    swapped_order = (mcp_order * tip_order) < 0.0
+    is_fingers_crossed = (
+        index_extended
+        and middle_extended
+        and index_middle_tip_dist_norm < 0.42
+        and swapped_order
+    )
 
     extended = {
         "thumb": thumb_extended,
@@ -94,6 +110,7 @@ def compute_features(obs: HandObservation) -> GestureFeatures:
         and index_extended
         and middle_extended
         and pinch_distance_norm > 0.55
+        and not is_fingers_crossed
     )
 
     # Fist is four fingers curled plus thumb folded toward palm.
@@ -110,6 +127,7 @@ def compute_features(obs: HandObservation) -> GestureFeatures:
         finger_extended=extended,
         is_open_palm=is_open_palm,
         is_fist=is_fist,
+        is_fingers_crossed=is_fingers_crossed,
         palm_scale=palm_scale,
         cursor_point_norm=cursor_point,
         hand_center_norm=hand_center,
