@@ -13,11 +13,12 @@ PUnity is a Windows 11 desktop app that tracks one hand from a webcam and turns 
   - Idle timeout
   - Confidence gating
 - JSON profile configuration for thresholds, smoothing, mappings, and safety
-- OpenCV overlay HUD for state, gesture, confidence, and FPS
-- Tron-style control GUI (`punity-gui`) with:
+- PUnity control GUI (`punity-gui`) with embedded engine runtime:
+  - webcam preview + HUD inside the app window
   - gesture toolbar (what/how/action)
-  - command panel
-  - profile manager + settings editor
+  - dedicated HUD panel (outside camera feed)
+  - profile manager + live settings editor
+  - view dropdowns (preview mode and layout mode)
   - start/stop engine controls + runtime log
 
 ## Python version requirement
@@ -44,20 +45,19 @@ pip install -e .
 
 ## Run
 
-Core engine (overlay only):
-
-```powershell
-punity --profile profiles/default.json
-```
-
-Tron GUI controller:
+Unified PUnity GUI (recommended):
 
 ```powershell
 punity-gui
 ```
 
+Optional engine-only mode (OpenCV window):
+
+```powershell
+punity --profile profiles/default.json
+```
+
 - Press `F8` to toggle active/pause instantly.
-- Press `Q` or `Esc` in the preview window to exit.
 
 ## Gesture Set
 
@@ -103,7 +103,7 @@ src/punity/
   actions/dispatcher.py
   config/profile.py
   ui/overlay.py
-  ui/tron_gui.py
+  ui/punity_gui.py
   app.py
 ```
 

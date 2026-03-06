@@ -12,6 +12,7 @@ from punity.capture.camera import CameraCapture, CameraConfig
 from punity.config.profile import AppProfile, load_profile
 from punity.control.fsm import ControlConfig, ControlFSM
 from punity.gestures.recognizer import GestureConfig, GestureRecognizer
+from punity.models import GestureLabel
 from punity.tracking.filters import EMAFilter2D, OneEuroFilter2D
 from punity.tracking.hand_state import HandStateTracker
 from punity.ui.overlay import draw_overlay
@@ -75,15 +76,19 @@ class GestureMouseApp:
             )
 
         self._active = True
+        self._crossed_latch = False
         self._fps = 0.0
         self._last_frame_t = time.monotonic()
         self._kill_switch_token = profile.safety.kill_switch_key.lower().strip()
         self._listener = keyboard.Listener(on_press=self._on_key_press)
 
+    def _toggle_active(self) -> None:
+        self._active = not self._active
+        self._fsm.set_active(self._active)
+
     def _on_key_press(self, key) -> None:
         if _key_matches(key, self._kill_switch_token):
-            self._active = not self._active
-            self._fsm.set_active(self._active)
+            self._toggle_active()
 
     def run(self) -> None:
         self._listener.start()
@@ -93,10 +98,23 @@ class GestureMouseApp:
                 if self._profile.overlay.mirror_preview:
                     frame_bgr = cv2.flip(frame_bgr, 1)
 
-                frame_rgb = self._detector.bgr_to_rgb(frame_bgr)
+                detect_bgr = frame_bgr
+                frame_h, frame_w = frame_bgr.shape[:2]
+                if frame_w > 640:
+                    detect_h = max(1, int(frame_h * (640.0 / frame_w)))
+                    detect_bgr = cv2.resize(frame_bgr, (640, detect_h), interpolation=cv2.INTER_LINEAR)
+
+                frame_rgb = self._detector.bgr_to_rgb(detect_bgr)
                 observation = self._detector.detect(frame_rgb, t_ms)
 
                 gesture = self._recognizer.recognize(observation, t_ms)
+                if gesture.label == GestureLabel.FINGERS_CROSSED:
+                    if not self._crossed_latch:
+                        self._toggle_active()
+                    self._crossed_latch = True
+                else:
+                    self._crossed_latch = False
+
                 if gesture.cursor_point_norm is not None:
                     gesture.cursor_point_norm = self._cursor_filter.update(gesture.cursor_point_norm)
                 else:

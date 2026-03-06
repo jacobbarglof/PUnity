@@ -41,11 +41,7 @@ class ControlFSM:
             self._last_label = gesture.label
             return events
 
-        if (
-            not hand_status.present
-            or hand_status.confidence < self.config.min_confidence
-            or hand_status.idle
-        ):
+        if not hand_status.present or hand_status.confidence < self.config.min_confidence:
             self._release_if_needed(events)
             self.state = AppState.ARMED
             self._last_label = gesture.label
@@ -54,6 +50,12 @@ class ControlFSM:
         if gesture.label == GestureLabel.FIST:
             self._release_if_needed(events)
             self.state = AppState.IDLE
+            self._last_label = gesture.label
+            return events
+
+        if hand_status.idle:
+            self._release_if_needed(events)
+            self.state = AppState.ARMED
             self._last_label = gesture.label
             return events
 

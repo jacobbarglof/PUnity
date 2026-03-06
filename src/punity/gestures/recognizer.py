@@ -20,15 +20,20 @@ class GestureRecognizer:
     def __init__(self, config: GestureConfig) -> None:
         self._config = config
         self._pinching = False
-        self._last_center: tuple[float, float] | None = None
+
+        self._last_swipe_point: tuple[float, float] | None = None
+        self._swipe_anchor: tuple[float, float] | None = None
         self._last_t_ms: int | None = None
         self._last_swipe_ms = 0
+        self._smoothed_vx = 0.0
 
     def recognize(self, observation: HandObservation | None, t_ms: int) -> GestureFrame:
         if observation is None:
             self._pinching = False
-            self._last_center = None
+            self._last_swipe_point = None
+            self._swipe_anchor = None
             self._last_t_ms = None
+            self._smoothed_vx = 0.0
             return GestureFrame(
                 label=GestureLabel.NONE,
                 cursor_point_norm=None,
@@ -47,21 +52,32 @@ class GestureRecognizer:
         elif pinch_dist <= self._config.pinch_on:
             self._pinching = True
 
-        label = GestureLabel.NONE
-        if self._pinching:
-            label = GestureLabel.PINCHING
-        elif features.is_fist:
-            label = GestureLabel.FIST
-        elif features.is_open_palm:
-            label = GestureLabel.OPEN_PALM
+        can_swipe = (
+            features.is_open_palm
+            and not self._pinching
+            and not features.is_fist
+            and not features.is_fingers_crossed
+        )
 
         swipe = None
         if self._config.swipe_enabled:
-            swipe = self._detect_swipe(features.hand_center_norm, t_ms, label)
-            if swipe == "LEFT":
-                label = GestureLabel.SWIPE_LEFT
-            elif swipe == "RIGHT":
-                label = GestureLabel.SWIPE_RIGHT
+            swipe = self._detect_swipe(features.cursor_point_norm, t_ms, can_swipe)
+
+        # Priority order for deterministic control: crossed toggle > fist safety > pinch > open.
+        label = GestureLabel.NONE
+        if features.is_fingers_crossed:
+            label = GestureLabel.FINGERS_CROSSED
+        elif features.is_fist:
+            label = GestureLabel.FIST
+        elif self._pinching:
+            label = GestureLabel.PINCHING
+        elif features.is_open_palm:
+            label = GestureLabel.OPEN_PALM
+
+        if swipe == "LEFT":
+            label = GestureLabel.SWIPE_LEFT
+        elif swipe == "RIGHT":
+            label = GestureLabel.SWIPE_RIGHT
 
         conf = min(observation.detection_confidence, 1.0)
         return GestureFrame(
@@ -75,34 +91,54 @@ class GestureRecognizer:
 
     def _detect_swipe(
         self,
-        center: tuple[float, float],
+        point: tuple[float, float],
         t_ms: int,
-        label: GestureLabel,
+        can_swipe: bool,
     ) -> str | None:
-        if label not in (GestureLabel.OPEN_PALM, GestureLabel.NONE):
-            self._last_center = center
+        if self._last_swipe_point is None or self._last_t_ms is None:
+            self._last_swipe_point = point
+            self._swipe_anchor = point
             self._last_t_ms = t_ms
-            return None
-
-        if self._last_center is None or self._last_t_ms is None:
-            self._last_center = center
-            self._last_t_ms = t_ms
+            self._smoothed_vx = 0.0
             return None
 
         dt_ms = max(1, t_ms - self._last_t_ms)
-        dx = center[0] - self._last_center[0]
-        dy = center[1] - self._last_center[1]
-        vx = dx / (dt_ms / 1000.0)
-        vy = dy / (dt_ms / 1000.0)
+        dt_s = dt_ms / 1000.0
+        dx = point[0] - self._last_swipe_point[0]
+        dy = point[1] - self._last_swipe_point[1]
+        vx = dx / dt_s
+        vy = dy / dt_s
 
-        self._last_center = center
+        alpha = min(1.0, dt_ms / 30.0)
+        self._smoothed_vx = (1.0 - alpha) * self._smoothed_vx + alpha * vx
+
+        self._last_swipe_point = point
         self._last_t_ms = t_ms
 
-        if t_ms - self._last_swipe_ms < self._config.swipe_cooldown_ms:
+        if not can_swipe:
+            self._swipe_anchor = point
+            self._smoothed_vx = 0.0
             return None
 
-        if abs(vx) >= self._config.swipe_velocity_threshold and abs(vy) < abs(vx) * 0.55:
-            self._last_swipe_ms = t_ms
-            return "RIGHT" if vx > 0 else "LEFT"
+        if self._swipe_anchor is None:
+            self._swipe_anchor = point
 
-        return None
+        disp_x = point[0] - self._swipe_anchor[0]
+
+        effective_cooldown = max(200, int(self._config.swipe_cooldown_ms * 0.6))
+        if t_ms - self._last_swipe_ms < effective_cooldown:
+            return None
+
+        if abs(disp_x) < 0.04:
+            return None
+
+        required_v = max(0.30, self._config.swipe_velocity_threshold * 0.45)
+        if abs(self._smoothed_vx) < required_v:
+            return None
+
+        if abs(vy) > abs(self._smoothed_vx) * 1.5:
+            return None
+
+        self._last_swipe_ms = t_ms
+        self._swipe_anchor = point
+        return "RIGHT" if self._smoothed_vx > 0 else "LEFT"

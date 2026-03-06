@@ -1,17 +1,17 @@
 {
   "thresholds": {
-    "pinch_on": 0.52,
-    "pinch_off": 0.67,
+    "pinch_on": 0.44,
+    "pinch_off": 0.5,
     "min_confidence": 0.65,
     "min_detection_confidence": 0.72,
     "min_tracking_confidence": 0.62
   },
   "cursor": {
-    "sensitivity": 0.56,
+    "sensitivity": 0.16,
     "accel": 0.32,
-    "smoothing": 0.34,
+    "smoothing": 0.14,
     "filter": "one_euro",
-    "deadzone_px": 3.0
+    "deadzone_px": 0.1
   },
   "safety": {
     "kill_switch_key": "f8",
@@ -20,14 +20,14 @@
   },
   "swipe": {
     "enabled": true,
-    "velocity_threshold": 1.7,
+    "velocity_threshold": 1.15,
     "cooldown_ms": 850
   },
   "camera": {
     "device_index": 0,
     "width": 1280,
     "height": 720,
-    "fps": 60
+    "fps": 30
   },
   "overlay": {
     "enabled": true,

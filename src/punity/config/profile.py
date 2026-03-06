@@ -7,8 +7,8 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class ThresholdConfig:
-    pinch_on: float = 0.52
-    pinch_off: float = 0.67
+    pinch_on: float = 0.44
+    pinch_off: float = 0.60
     min_confidence: float = 0.65
     min_detection_confidence: float = 0.7
     min_tracking_confidence: float = 0.6
@@ -33,7 +33,7 @@ class SafetyProfile:
 @dataclass(slots=True)
 class SwipeProfile:
     enabled: bool = True
-    velocity_threshold: float = 1.7
+    velocity_threshold: float = 1.15
     cooldown_ms: int = 850
 
 
@@ -42,7 +42,7 @@ class CameraProfile:
     device_index: int = 0
     width: int = 1280
     height: int = 720
-    fps: int = 60
+    fps: int = 30
 
 
 @dataclass(slots=True)
@@ -105,5 +105,3 @@ def load_profile(path: str | Path) -> AppProfile:
         overlay=OverlayProfile(**merged["overlay"]),
         mappings=merged.get("mappings", {}),
     )
-
-
