@@ -1,7 +1,7 @@
 {
   "thresholds": {
-    "pinch_on": 0.52,
-    "pinch_off": 0.67,
+    "pinch_on": 0.44,
+    "pinch_off": 0.60,
     "min_confidence": 0.65,
     "min_detection_confidence": 0.72,
     "min_tracking_confidence": 0.62

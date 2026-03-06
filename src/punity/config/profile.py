@@ -7,8 +7,8 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class ThresholdConfig:
-    pinch_on: float = 0.52
-    pinch_off: float = 0.67
+    pinch_on: float = 0.44
+    pinch_off: float = 0.60
     min_confidence: float = 0.65
     min_detection_confidence: float = 0.7
     min_tracking_confidence: float = 0.6

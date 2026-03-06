@@ -1,15 +1,38 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import queue
-import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
+
+import cv2
 import tkinter as tk
+from PIL import Image, ImageTk
+from pynput import keyboard
 from tkinter import messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
+
+from punity.actions.dispatcher import ActionDispatcher, CursorConfig
+from punity.capture.camera import CameraCapture, CameraConfig
+from punity.config.profile import (
+    AppProfile,
+    CameraProfile,
+    CursorProfile,
+    OverlayProfile,
+    SafetyProfile,
+    SwipeProfile,
+    ThresholdConfig,
+)
+from punity.control.fsm import ControlConfig, ControlFSM
+from punity.gestures.recognizer import GestureConfig, GestureRecognizer
+from punity.tracking.filters import EMAFilter2D, OneEuroFilter2D
+from punity.tracking.hand_state import HandStateTracker
+from punity.ui.overlay import draw_overlay
 
 
 def _detect_project_root() -> Path:
@@ -36,6 +59,8 @@ SETTINGS_FIELDS: tuple[SettingField, ...] = (
     SettingField("thresholds", "pinch_on", "Pinch Engage", "float"),
     SettingField("thresholds", "pinch_off", "Pinch Release", "float"),
     SettingField("thresholds", "min_confidence", "Min Confidence", "float"),
+    SettingField("thresholds", "min_detection_confidence", "Min Detection Confidence", "float"),
+    SettingField("thresholds", "min_tracking_confidence", "Min Tracking Confidence", "float"),
     SettingField("cursor", "sensitivity", "Cursor Sensitivity", "float"),
     SettingField("cursor", "accel", "Cursor Accel", "float"),
     SettingField("cursor", "smoothing", "Cursor Smoothing", "float"),
@@ -61,7 +86,338 @@ GESTURE_GUIDE: tuple[tuple[str, str, str], ...] = (
 )
 
 
-class TronControlApp(tk.Tk):
+def _deep_merge(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
+    out = dict(dst)
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _default_profile_dict() -> dict[str, Any]:
+    profile = AppProfile(
+        thresholds=ThresholdConfig(),
+        cursor=CursorProfile(),
+        safety=SafetyProfile(),
+        swipe=SwipeProfile(),
+        camera=CameraProfile(),
+        overlay=OverlayProfile(),
+        mappings={
+            "SWIPE_LEFT": {
+                "event": "HOTKEY",
+                "keys": ["cmd", "ctrl", "left"],
+                "cooldown_ms": 1200,
+            },
+            "SWIPE_RIGHT": {
+                "event": "HOTKEY",
+                "keys": ["cmd", "ctrl", "right"],
+                "cooldown_ms": 1200,
+            },
+        },
+    )
+    return asdict(profile)
+
+
+def _profile_from_dict(raw: dict[str, Any]) -> AppProfile:
+    merged = _deep_merge(_default_profile_dict(), raw)
+    return AppProfile(
+        thresholds=ThresholdConfig(**merged["thresholds"]),
+        cursor=CursorProfile(**merged["cursor"]),
+        safety=SafetyProfile(**merged["safety"]),
+        swipe=SwipeProfile(**merged["swipe"]),
+        camera=CameraProfile(**merged["camera"]),
+        overlay=OverlayProfile(**merged["overlay"]),
+        mappings=merged.get("mappings", {}),
+    )
+
+
+def _ensure_supported_python() -> None:
+    if sys.version_info < (3, 12) or sys.version_info >= (3, 13):
+        ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+        raise RuntimeError(
+            f"Python {ver} detected. PUnity GUI requires Python 3.12.x for MediaPipe Hands support."
+        )
+
+
+def _apply_dark_title_bar(window: tk.Tk) -> None:
+    if sys.platform != "win32":
+        return
+
+    try:
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        enabled = ctypes.c_int(1)
+        for attr in (20, 19):
+            result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                ctypes.c_int(attr),
+                ctypes.byref(enabled),
+                ctypes.sizeof(enabled),
+            )
+            if result == 0:
+                break
+
+        # Win11 caption colors: black title bar with light caption text.
+        caption_color = ctypes.c_uint(0x000000)
+        text_color = ctypes.c_uint(0xFFFFFF)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            ctypes.c_int(35),
+            ctypes.byref(caption_color),
+            ctypes.sizeof(caption_color),
+        )
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd,
+            ctypes.c_int(36),
+            ctypes.byref(text_color),
+            ctypes.sizeof(text_color),
+        )
+    except Exception:
+        pass
+
+
+class PUnityRuntimeEngine:
+    def __init__(
+        self,
+        initial_profile: dict[str, Any],
+        log_queue: queue.Queue[str],
+        frame_queue: queue.Queue[Any],
+    ) -> None:
+        self._log_queue = log_queue
+        self._frame_queue = frame_queue
+
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+        self._config_lock = threading.Lock()
+        self._profile_dict = json.loads(json.dumps(initial_profile))
+        self._profile_version = 1
+
+        self._active = True
+        self._active_lock = threading.Lock()
+        self._kill_switch_token = "f8"
+        self._listener: keyboard.Listener | None = None
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        if self.is_running:
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.5)
+        self._thread = None
+
+    def update_profile(self, profile_data: dict[str, Any]) -> None:
+        with self._config_lock:
+            self._profile_dict = json.loads(json.dumps(profile_data))
+            self._profile_version += 1
+            safety = self._profile_dict.get("safety", {})
+            if isinstance(safety, dict):
+                self._kill_switch_token = str(safety.get("kill_switch_key", "f8")).strip().lower()
+
+    def _read_profile_snapshot(self) -> tuple[dict[str, Any], int]:
+        with self._config_lock:
+            return json.loads(json.dumps(self._profile_dict)), self._profile_version
+
+    def _toggle_active(self) -> None:
+        with self._active_lock:
+            self._active = not self._active
+            state = "ACTIVE" if self._active else "PAUSED"
+            self._log_queue.put(f"Kill switch toggled -> {state}")
+
+    def _is_active(self) -> bool:
+        with self._active_lock:
+            return self._active
+
+    def _on_key_press(self, key) -> None:
+        token = self._kill_switch_token
+        if len(token) == 1:
+            if getattr(key, "char", "") == token:
+                self._toggle_active()
+            return
+
+        key_name = token if token.startswith("Key.") else f"Key.{token}"
+        if str(key) == key_name:
+            self._toggle_active()
+
+    def _push_frame(self, frame_bgr) -> None:
+        try:
+            self._frame_queue.put_nowait(frame_bgr)
+        except queue.Full:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frame_queue.put_nowait(frame_bgr)
+            except queue.Full:
+                pass
+    def _run(self) -> None:
+        camera: CameraCapture | None = None
+        detector = None
+        recognizer: GestureRecognizer | None = None
+        hand_state: HandStateTracker | None = None
+        fsm: ControlFSM | None = None
+        dispatcher: ActionDispatcher | None = None
+        cursor_filter = None
+        profile: AppProfile | None = None
+        profile_version = 0
+        fps = 0.0
+        last_t = time.monotonic()
+
+        from punity.perception.hands import HandsDetector
+
+        def rebuild_pipeline(raw_profile: dict[str, Any]) -> AppProfile:
+            nonlocal camera, detector, recognizer, hand_state, fsm, dispatcher, cursor_filter
+
+            parsed = _profile_from_dict(raw_profile)
+
+            if camera is not None:
+                camera.release()
+            if detector is not None:
+                detector.close()
+
+            camera = CameraCapture(
+                CameraConfig(
+                    device_index=parsed.camera.device_index,
+                    width=parsed.camera.width,
+                    height=parsed.camera.height,
+                    fps=parsed.camera.fps,
+                )
+            )
+            detector = HandsDetector(
+                min_detection_confidence=parsed.thresholds.min_detection_confidence,
+                min_tracking_confidence=parsed.thresholds.min_tracking_confidence,
+                max_num_hands=1,
+            )
+            recognizer = GestureRecognizer(
+                GestureConfig(
+                    pinch_on=parsed.thresholds.pinch_on,
+                    pinch_off=parsed.thresholds.pinch_off,
+                    min_confidence=parsed.thresholds.min_confidence,
+                    swipe_enabled=parsed.swipe.enabled,
+                    swipe_velocity_threshold=parsed.swipe.velocity_threshold,
+                    swipe_cooldown_ms=parsed.swipe.cooldown_ms,
+                )
+            )
+            hand_state = HandStateTracker(
+                lost_timeout_ms=450,
+                idle_timeout_ms=parsed.safety.idle_timeout_ms,
+            )
+            fsm = ControlFSM(
+                config=ControlConfig(
+                    min_confidence=parsed.thresholds.min_confidence,
+                    require_open_palm=parsed.safety.require_open_palm,
+                    hotkey_cooldown_ms=900,
+                )
+            )
+            dispatcher = ActionDispatcher(
+                CursorConfig(
+                    sensitivity=parsed.cursor.sensitivity,
+                    accel=parsed.cursor.accel,
+                    deadzone_px=parsed.cursor.deadzone_px,
+                )
+            )
+
+            if parsed.cursor.filter == "ema":
+                cursor_filter = EMAFilter2D(alpha=parsed.cursor.smoothing)
+            else:
+                cursor_filter = OneEuroFilter2D(
+                    freq=max(5.0, float(parsed.camera.fps)),
+                    min_cutoff=max(0.5, parsed.cursor.smoothing * 4.0),
+                    beta=0.02,
+                    d_cutoff=1.2,
+                )
+
+            self._kill_switch_token = parsed.safety.kill_switch_key.lower().strip()
+            self._log_queue.put("Pipeline updated from settings")
+            return parsed
+
+        try:
+            self._listener = keyboard.Listener(on_press=self._on_key_press)
+            self._listener.start()
+
+            raw_profile, profile_version = self._read_profile_snapshot()
+            profile = rebuild_pipeline(raw_profile)
+
+            while not self._stop_event.is_set():
+                raw_profile, next_ver = self._read_profile_snapshot()
+                if next_ver != profile_version:
+                    profile = rebuild_pipeline(raw_profile)
+                    profile_version = next_ver
+
+                assert camera is not None
+                assert detector is not None
+                assert recognizer is not None
+                assert hand_state is not None
+                assert fsm is not None
+                assert dispatcher is not None
+                assert cursor_filter is not None
+                assert profile is not None
+
+                frame_bgr, t_ms = camera.read_frame()
+                if profile.overlay.mirror_preview:
+                    frame_bgr = cv2.flip(frame_bgr, 1)
+
+                frame_rgb = detector.bgr_to_rgb(frame_bgr)
+                observation = detector.detect(frame_rgb, t_ms)
+
+                gesture = recognizer.recognize(observation, t_ms)
+                if gesture.cursor_point_norm is not None:
+                    gesture.cursor_point_norm = cursor_filter.update(gesture.cursor_point_norm)
+                else:
+                    cursor_filter.reset()
+
+                hand_status = hand_state.update(observation, t_ms, gesture.cursor_point_norm)
+
+                fsm.set_active(self._is_active())
+                events = fsm.step(gesture, hand_status, t_ms, profile.mappings)
+                for event in events:
+                    dispatcher.execute(event)
+
+                now = time.monotonic()
+                dt = now - last_t
+                last_t = now
+                if dt > 0:
+                    instant = 1.0 / dt
+                    if fps <= 0.0:
+                        fps = instant
+                    else:
+                        fps = fps * 0.9 + instant * 0.1
+
+                draw_overlay(
+                    frame_bgr=frame_bgr,
+                    state=fsm.state,
+                    gesture=gesture,
+                    fps=fps,
+                    active=self._is_active(),
+                    idle=hand_status.idle,
+                )
+                self._push_frame(frame_bgr)
+
+        except Exception as exc:
+            self._log_queue.put(f"Engine error: {exc}")
+        finally:
+            if self._listener is not None:
+                self._listener.stop()
+                self._listener = None
+            if camera is not None:
+                camera.release()
+            if detector is not None:
+                detector.close()
+            self._log_queue.put("Engine stopped")
+
+
+class PUnityControlApp(tk.Tk):
     BG = "#020912"
     PANEL = "#07111d"
     PANEL_ALT = "#0a1624"
@@ -73,16 +429,19 @@ class TronControlApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("PUnity Control Grid")
-        self.geometry("1420x900")
-        self.minsize(1200, 760)
+        self.title("PUnity Control Console")
+        self.geometry("1520x940")
+        self.minsize(1220, 800)
         self.configure(bg=self.BG)
 
-        self._engine_proc: subprocess.Popen[str] | None = None
-        self._log_queue: queue.Queue[str] = queue.Queue()
-        self._profile_data: dict[str, object] = {}
+        self._profile_data: dict[str, Any] = {}
         self._field_vars: dict[tuple[str, str], tk.Variable] = {}
         self._gesture_action_labels: dict[str, tk.Label] = {}
+        self._preview_photo: ImageTk.PhotoImage | None = None
+
+        self._log_queue: queue.Queue[str] = queue.Queue()
+        self._frame_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+        self._engine: PUnityRuntimeEngine | None = None
 
         self.profile_name_var = tk.StringVar(value="default.json")
         self.runtime_status_var = tk.StringVar(value="IDLE")
@@ -90,17 +449,19 @@ class TronControlApp(tk.Tk):
         self._configure_ttk()
         self._build_layout()
         self._set_runtime_status("IDLE", good=False)
+
         self._refresh_profile_list()
         self._load_profile_into_editor(self.profile_name_var.get())
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(120, self._poll_runtime)
+        self.after(50, lambda: _apply_dark_title_bar(self))
 
     def _configure_ttk(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure(
-            "Tron.TCombobox",
+            "PUnity.TCombobox",
             fieldbackground=self.PANEL_ALT,
             background=self.PANEL_ALT,
             foreground=self.TEXT,
@@ -115,7 +476,7 @@ class TronControlApp(tk.Tk):
 
         title = tk.Label(
             header,
-            text="PUNITY // TRON COMMAND CONSOLE",
+            text="PUNITY // CONTROL CONSOLE",
             bg=self.BG,
             fg=self.ACCENT,
             font=("Consolas", 18, "bold"),
@@ -141,11 +502,10 @@ class TronControlApp(tk.Tk):
 
         self.start_btn = self._make_button(status_frame, "Start Engine", self._on_start_engine)
         self.start_btn.pack(side="left", padx=(0, 8))
-
         self.stop_btn = self._make_button(status_frame, "Stop Engine", self._on_stop_engine, warn=True)
         self.stop_btn.pack(side="left")
 
-        gestures_panel = self._make_panel(self, "GESTURE TOOLBAR")
+        gestures_panel = self._make_panel(self, "GESTURES")
         gestures_panel.pack(fill="x", padx=16, pady=(0, 10))
         self._build_gesture_toolbar(gestures_panel.content)
 
@@ -157,19 +517,36 @@ class TronControlApp(tk.Tk):
 
         left_col = tk.Frame(body, bg=self.BG)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        left_col.grid_rowconfigure(0, weight=2)
-        left_col.grid_rowconfigure(1, weight=3)
+        left_col.grid_rowconfigure(0, weight=4)
+        left_col.grid_rowconfigure(1, weight=1)
+        left_col.grid_rowconfigure(2, weight=2)
         left_col.grid_columnconfigure(0, weight=1)
 
-        commands_panel = self._make_panel(left_col, "COMMANDS")
-        commands_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        preview_panel = self._make_panel(left_col, "LIVE CAMERA + HUD")
+        preview_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+        preview_panel.content.grid_rowconfigure(0, weight=1)
+        preview_panel.content.grid_columnconfigure(0, weight=1)
 
+        self.preview_label = tk.Label(
+            preview_panel.content,
+            text="Engine stopped",
+            bg="#04070d",
+            fg=self.ACCENT,
+            font=("Consolas", 12, "bold"),
+            anchor="center",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=self.ACCENT,
+        )
+        self.preview_label.grid(row=0, column=0, sticky="nsew")
+        commands_panel = self._make_panel(left_col, "COMMANDS")
+        commands_panel.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         self.commands_text = tk.Text(
             commands_panel.content,
             bg=self.PANEL_ALT,
             fg=self.ACCENT_SOFT,
             insertbackground=self.ACCENT,
-            font=("Consolas", 11),
+            font=("Consolas", 10),
             bd=0,
             relief="flat",
             wrap="word",
@@ -178,8 +555,7 @@ class TronControlApp(tk.Tk):
         self.commands_text.configure(state="disabled")
 
         logs_panel = self._make_panel(left_col, "RUNTIME LOG")
-        logs_panel.grid(row=1, column=0, sticky="nsew")
-
+        logs_panel.grid(row=2, column=0, sticky="nsew")
         self.logs_text = ScrolledText(
             logs_panel.content,
             bg="#04070d",
@@ -263,17 +639,16 @@ class TronControlApp(tk.Tk):
             card.grid(row=0, column=col, sticky="nsew", padx=(0, 8 if col < len(GESTURE_GUIDE) - 1 else 0))
             parent.grid_columnconfigure(col, weight=1)
 
-            name_label = tk.Label(
+            tk.Label(
                 card,
                 text=name,
                 bg=self.PANEL_ALT,
                 fg=self.ACCENT,
                 font=("Consolas", 11, "bold"),
                 anchor="w",
-            )
-            name_label.pack(fill="x")
+            ).pack(fill="x")
 
-            how_label = tk.Label(
+            tk.Label(
                 card,
                 text=f"How: {how_to}",
                 bg=self.PANEL_ALT,
@@ -281,9 +656,8 @@ class TronControlApp(tk.Tk):
                 font=("Consolas", 9),
                 justify="left",
                 anchor="w",
-                wraplength=240,
-            )
-            how_label.pack(fill="x", pady=(4, 4))
+                wraplength=260,
+            ).pack(fill="x", pady=(4, 4))
 
             action_label = tk.Label(
                 card,
@@ -293,30 +667,28 @@ class TronControlApp(tk.Tk):
                 font=("Consolas", 9, "bold"),
                 justify="left",
                 anchor="w",
-                wraplength=240,
+                wraplength=260,
             )
             action_label.pack(fill="x")
-
             self._gesture_action_labels[name] = action_label
 
     def _build_profile_manager(self, parent: tk.Frame) -> None:
         row = tk.Frame(parent, bg=self.PANEL)
         row.pack(fill="x")
 
-        profile_label = tk.Label(
+        tk.Label(
             row,
             text="Profile",
             bg=self.PANEL,
             fg=self.TEXT,
             font=("Consolas", 10),
-        )
-        profile_label.pack(side="left", padx=(0, 8))
+        ).pack(side="left", padx=(0, 8))
 
         self.profile_combo = ttk.Combobox(
             row,
             textvariable=self.profile_name_var,
             state="readonly",
-            style="Tron.TCombobox",
+            style="PUnity.TCombobox",
             width=28,
         )
         self.profile_combo.pack(side="left", fill="x", expand=True)
@@ -326,6 +698,7 @@ class TronControlApp(tk.Tk):
         actions.pack(fill="x", pady=(10, 0))
 
         self._make_button(actions, "Reload", self._on_reload_profile).pack(side="left", padx=(0, 8))
+        self._make_button(actions, "Apply Live", self._on_apply_live).pack(side="left", padx=(0, 8))
         self._make_button(actions, "Save", self._on_save_profile).pack(side="left", padx=(0, 8))
         self._make_button(actions, "Save As", self._on_save_as_profile).pack(side="left")
 
@@ -334,15 +707,14 @@ class TronControlApp(tk.Tk):
         grid.pack(fill="x")
 
         for row_idx, field in enumerate(SETTINGS_FIELDS):
-            label = tk.Label(
+            tk.Label(
                 grid,
                 text=field.label,
                 bg=self.PANEL,
                 fg=self.TEXT,
                 font=("Consolas", 10),
                 anchor="w",
-            )
-            label.grid(row=row_idx, column=0, sticky="w", padx=(0, 10), pady=3)
+            ).grid(row=row_idx, column=0, sticky="w", padx=(0, 10), pady=3)
 
             if field.kind == "bool":
                 var = tk.BooleanVar(value=False)
@@ -351,6 +723,7 @@ class TronControlApp(tk.Tk):
                     variable=var,
                     onvalue=True,
                     offvalue=False,
+                    command=self._auto_apply_live,
                     bg=self.PANEL,
                     activebackground=self.PANEL,
                     fg=self.ACCENT,
@@ -372,21 +745,22 @@ class TronControlApp(tk.Tk):
                     highlightbackground=self.ACCENT,
                     font=("Consolas", 10),
                 )
+                widget.bind("<FocusOut>", lambda _e: self._auto_apply_live())
+                widget.bind("<Return>", lambda _e: self._auto_apply_live())
 
             widget.grid(row=row_idx, column=1, sticky="ew", pady=3)
             self._field_vars[(field.section, field.key)] = var
 
         grid.grid_columnconfigure(1, weight=1)
 
-        mapping_label = tk.Label(
+        tk.Label(
             parent,
             text="Mappings JSON",
             bg=self.PANEL,
             fg=self.TEXT,
             font=("Consolas", 10),
             anchor="w",
-        )
-        mapping_label.pack(fill="x", pady=(10, 4))
+        ).pack(fill="x", pady=(10, 4))
 
         self.mapping_text = ScrolledText(
             parent,
@@ -402,14 +776,15 @@ class TronControlApp(tk.Tk):
             wrap="none",
         )
         self.mapping_text.pack(fill="both", expand=True)
+        self.mapping_text.bind("<FocusOut>", lambda _e: self._auto_apply_live())
+        self.mapping_text.bind("<Control-Return>", lambda _e: (self._on_apply_live(), "break")[1])
 
     def _refresh_profile_list(self) -> None:
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
         names = sorted(path.name for path in PROFILES_DIR.glob("*.json"))
-
         if not names:
             fallback = PROFILES_DIR / "default.json"
-            fallback.write_text("{}\n", encoding="utf-8")
+            fallback.write_text(json.dumps(_default_profile_dict(), indent=2) + "\n", encoding="utf-8")
             names = [fallback.name]
 
         self.profile_combo["values"] = names
@@ -419,15 +794,12 @@ class TronControlApp(tk.Tk):
 
     def _on_profile_selected(self, _event=None) -> None:
         self._load_profile_into_editor(self.profile_name_var.get())
-
-    def _on_reload_profile(self) -> None:
-        self._load_profile_into_editor(self.profile_name_var.get())
-        self._append_log("Profile reloaded")
-
     def _load_profile_into_editor(self, profile_name: str) -> None:
         path = PROFILES_DIR / profile_name
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            parsed = _profile_from_dict(raw)
+            data = asdict(parsed)
         except Exception as exc:
             messagebox.showerror("Profile Load Error", f"Failed to load profile:\n{exc}")
             return
@@ -437,13 +809,21 @@ class TronControlApp(tk.Tk):
         self._refresh_mappings_editor()
         self._refresh_commands_panel()
         self._refresh_gesture_actions()
+        self._append_log(f"Loaded profile {profile_name}")
+
+        if self._engine is not None and self._engine.is_running:
+            self._engine.update_profile(self._profile_data)
+            self._append_log("Live profile applied")
+
+    def _on_reload_profile(self) -> None:
+        self._load_profile_into_editor(self.profile_name_var.get())
 
     def _apply_profile_to_fields(self) -> None:
         for field in SETTINGS_FIELDS:
             section = self._profile_data.get(field.section, {})
             value = section.get(field.key) if isinstance(section, dict) else None
-
             var = self._field_vars[(field.section, field.key)]
+
             if field.kind == "bool":
                 var.set(bool(value))
             elif value is None:
@@ -459,8 +839,8 @@ class TronControlApp(tk.Tk):
         self.mapping_text.delete("1.0", tk.END)
         self.mapping_text.insert("1.0", json.dumps(mappings, indent=2))
 
-    def _collect_profile_from_fields(self) -> dict[str, object]:
-        data = json.loads(json.dumps(self._profile_data)) if self._profile_data else {}
+    def _collect_profile_from_fields(self) -> dict[str, Any]:
+        data = json.loads(json.dumps(self._profile_data)) if self._profile_data else _default_profile_dict()
 
         for field in SETTINGS_FIELDS:
             section = data.setdefault(field.section, {})
@@ -477,9 +857,9 @@ class TronControlApp(tk.Tk):
             raise ValueError("Mappings JSON must be an object")
         data["mappings"] = mappings
 
-        return data
+        return asdict(_profile_from_dict(data))
 
-    def _coerce_field_value(self, field: SettingField, raw: object) -> object:
+    def _coerce_field_value(self, field: SettingField, raw: object) -> Any:
         if field.kind == "bool":
             return bool(raw)
 
@@ -517,6 +897,10 @@ class TronControlApp(tk.Tk):
         self._refresh_commands_panel()
         self._refresh_gesture_actions()
 
+        if self._engine is not None and self._engine.is_running:
+            self._engine.update_profile(self._profile_data)
+            self._append_log("Live settings applied")
+
         if show_popup:
             messagebox.showinfo("Saved", f"Profile saved to\n{path}")
         return True
@@ -534,12 +918,40 @@ class TronControlApp(tk.Tk):
         if self._save_profile(show_popup=True):
             self._append_log(f"Created profile {clean}.json")
 
+    def _on_apply_live(self) -> None:
+        try:
+            data = self._collect_profile_from_fields()
+        except Exception as exc:
+            messagebox.showerror("Apply Error", f"Could not apply settings:\n{exc}")
+            return
+
+        self._profile_data = data
+        self._refresh_commands_panel()
+        self._refresh_gesture_actions()
+
+        if self._engine is not None and self._engine.is_running:
+            self._engine.update_profile(self._profile_data)
+            self._append_log("Live settings applied")
+
+    def _auto_apply_live(self) -> None:
+        if self._engine is None or not self._engine.is_running:
+            return
+
+        try:
+            data = self._collect_profile_from_fields()
+        except Exception:
+            return
+
+        self._profile_data = data
+        self._refresh_commands_panel()
+        self._refresh_gesture_actions()
+        self._engine.update_profile(self._profile_data)
+
     def _refresh_gesture_actions(self) -> None:
         for gesture_name, _how, default_action in GESTURE_GUIDE:
             label = self._gesture_action_labels.get(gesture_name)
             if label is None:
                 continue
-
             if gesture_name.startswith("SWIPE"):
                 action_text = self._format_mapping_action(gesture_name)
             else:
@@ -557,7 +969,7 @@ class TronControlApp(tk.Tk):
         lines = [
             "SYSTEM COMMANDS",
             f"  Kill Switch: {kill} (toggle active/pause)",
-            "  Stop App: Q or ESC in overlay window",
+            "  Stop Engine: Stop Engine button",
             "",
             "GESTURE COMMANDS",
             "  OPEN_PALM  -> Enable pointer movement",
@@ -567,9 +979,9 @@ class TronControlApp(tk.Tk):
             f"  SWIPE_LEFT -> {self._format_mapping_action('SWIPE_LEFT', mappings)}",
             f"  SWIPE_RIGHT-> {self._format_mapping_action('SWIPE_RIGHT', mappings)}",
             "",
-            "LAUNCH",
-            f"  CLI: punity --profile {self.profile_name_var.get()}",
-            "  GUI: punity-gui",
+            "NOTES",
+            "  HUD and webcam preview are embedded in this GUI.",
+            "  Settings support live apply while engine runs.",
         ]
 
         self.commands_text.configure(state="normal")
@@ -577,11 +989,7 @@ class TronControlApp(tk.Tk):
         self.commands_text.insert("1.0", "\n".join(lines))
         self.commands_text.configure(state="disabled")
 
-    def _format_mapping_action(
-        self,
-        gesture: str,
-        mappings: dict[str, object] | None = None,
-    ) -> str:
+    def _format_mapping_action(self, gesture: str, mappings: dict[str, Any] | None = None) -> str:
         if mappings is None:
             raw = self._profile_data.get("mappings", {})
             mappings = raw if isinstance(raw, dict) else {}
@@ -598,49 +1006,29 @@ class TronControlApp(tk.Tk):
         return event_name
 
     def _on_start_engine(self) -> None:
-        if self._engine_proc is not None and self._engine_proc.poll() is None:
+        if self._engine is not None and self._engine.is_running:
             return
-
-        if not self._save_profile(show_popup=False):
-            return
-
-        profile_path = PROFILES_DIR / self.profile_name_var.get()
-        cmd = [sys.executable, "-m", "punity", "--profile", str(profile_path)]
 
         try:
-            self._engine_proc = subprocess.Popen(
-                cmd,
-                cwd=str(PROJECT_ROOT),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+            self._profile_data = self._collect_profile_from_fields()
         except Exception as exc:
-            messagebox.showerror("Start Error", f"Could not start engine:\n{exc}")
+            messagebox.showerror("Start Error", f"Cannot start engine:\n{exc}")
             return
 
-        threading.Thread(target=self._read_engine_output, daemon=True).start()
+        self._engine = PUnityRuntimeEngine(self._profile_data, self._log_queue, self._frame_queue)
+        self._engine.start()
         self._set_runtime_status("RUNNING", good=True)
-        self._append_log(f"Engine started with profile {profile_path.name}")
+        self._append_log("Engine started")
 
     def _on_stop_engine(self) -> None:
-        if self._engine_proc is None:
+        if self._engine is None:
             return
 
-        if self._engine_proc.poll() is None:
-            self._engine_proc.terminate()
-            self._append_log("Stop requested")
-        else:
-            self._append_log("Engine already stopped")
-
-    def _read_engine_output(self) -> None:
-        proc = self._engine_proc
-        if proc is None or proc.stdout is None:
-            return
-
-        for line in proc.stdout:
-            self._log_queue.put(line.rstrip())
+        self._engine.stop()
+        self._engine = None
+        self._set_runtime_status("IDLE", good=False)
+        self._append_log("Engine stop requested")
+        self.preview_label.configure(image="", text="Engine stopped")
 
     def _poll_runtime(self) -> None:
         while True:
@@ -650,13 +1038,36 @@ class TronControlApp(tk.Tk):
                 break
             self._append_log(line)
 
-        if self._engine_proc is not None and self._engine_proc.poll() is not None:
-            code = self._engine_proc.returncode
-            self._append_log(f"Engine exited with code {code}")
-            self._engine_proc = None
+        latest_frame = None
+        while True:
+            try:
+                latest_frame = self._frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if latest_frame is not None:
+            self._render_preview(latest_frame)
+
+        if self._engine is not None and not self._engine.is_running:
+            self._engine = None
             self._set_runtime_status("IDLE", good=False)
 
-        self.after(120, self._poll_runtime)
+        self.after(90, self._poll_runtime)
+
+    def _render_preview(self, frame_bgr) -> None:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+
+        target_w = max(320, self.preview_label.winfo_width())
+        target_h = max(240, self.preview_label.winfo_height())
+        if target_w > 0 and target_h > 0:
+            scale = min(target_w / img.width, target_h / img.height)
+            new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+            img = img.resize(new_size, Image.Resampling.BILINEAR)
+
+        photo = ImageTk.PhotoImage(img)
+        self._preview_photo = photo
+        self.preview_label.configure(image=photo, text="")
 
     def _append_log(self, line: str) -> None:
         self.logs_text.configure(state="normal")
@@ -672,22 +1083,17 @@ class TronControlApp(tk.Tk):
             self.status_chip.configure(bg="#3a2512", fg=self.WARN, highlightbackground=self.WARN)
 
     def _on_close(self) -> None:
-        if self._engine_proc is not None and self._engine_proc.poll() is None:
-            try:
-                self._engine_proc.terminate()
-            except Exception:
-                pass
+        if self._engine is not None:
+            self._engine.stop()
+            self._engine = None
         self.destroy()
 
 
 def main() -> None:
-    app = TronControlApp()
+    _ensure_supported_python()
+    app = PUnityControlApp()
     app.mainloop()
 
 
 if __name__ == "__main__":
     main()
-
-
-
-

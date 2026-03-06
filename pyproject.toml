@@ -13,15 +13,15 @@ dependencies = [
     "opencv-python>=4.10.0",
     "mediapipe>=0.10.14,<=0.10.21",
     "pynput>=1.7.7",
+    "Pillow>=10.4.0",
 ]
 
 [project.scripts]
 punity = "punity.app:main"
-punity-gui = "punity.ui.tron_gui:main"
+punity-gui = "punity.ui.punity_gui:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
