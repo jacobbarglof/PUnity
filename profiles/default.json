@@ -11,7 +11,7 @@
     "accel": 0.32,
     "smoothing": 0.34,
     "filter": "one_euro",
-    "deadzone_px": 3
+    "deadzone_px": 3.0
   },
   "safety": {
     "kill_switch_key": "f8",
@@ -36,14 +36,21 @@
   "mappings": {
     "SWIPE_LEFT": {
       "event": "HOTKEY",
-      "keys": ["cmd", "ctrl", "left"],
+      "keys": [
+        "cmd",
+        "ctrl",
+        "left"
+      ],
       "cooldown_ms": 1200
     },
     "SWIPE_RIGHT": {
       "event": "HOTKEY",
-      "keys": ["cmd", "ctrl", "right"],
+      "keys": [
+        "cmd",
+        "ctrl",
+        "right"
+      ],
       "cooldown_ms": 1200
     }
   }
 }
-

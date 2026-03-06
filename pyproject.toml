@@ -7,7 +7,7 @@ name = "punity"
 version = "0.1.0"
 description = "Reliable webcam hand gestures for Windows 11 input control"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.12,<3.13"
 authors = [{ name = "PUnity" }]
 dependencies = [
     "opencv-python>=4.10.0",
@@ -17,11 +17,11 @@ dependencies = [
 
 [project.scripts]
 punity = "punity.app:main"
+punity-gui = "punity.ui.tron_gui:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
 
