@@ -12,7 +12,7 @@ class CameraConfig:
     device_index: int = 0
     width: int = 1280
     height: int = 720
-    fps: int = 60
+    fps: int = 75
 
 
 class CameraCapture:
@@ -49,4 +49,5 @@ class CameraCapture:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+
 

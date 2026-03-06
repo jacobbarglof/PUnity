@@ -16,8 +16,9 @@ PUnity is a Windows 11 desktop app that tracks one hand from a webcam and turns 
 - PUnity control GUI (`punity-gui`) with embedded engine runtime:
   - webcam preview + HUD inside the app window
   - gesture toolbar (what/how/action)
-  - command panel
+  - dedicated HUD panel (outside camera feed)
   - profile manager + live settings editor
+  - view dropdowns (preview mode and layout mode)
   - start/stop engine controls + runtime log
 
 ## Python version requirement

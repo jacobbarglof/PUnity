@@ -32,7 +32,7 @@ from punity.control.fsm import ControlConfig, ControlFSM
 from punity.gestures.recognizer import GestureConfig, GestureRecognizer
 from punity.tracking.filters import EMAFilter2D, OneEuroFilter2D
 from punity.tracking.hand_state import HandStateTracker
-from punity.ui.overlay import draw_overlay
+from punity.ui.overlay import draw_hand_skeleton
 
 
 def _detect_project_root() -> Path:
@@ -45,6 +45,8 @@ def _detect_project_root() -> Path:
 
 PROJECT_ROOT = _detect_project_root()
 PROFILES_DIR = PROJECT_ROOT / "profiles"
+PREVIEW_MODES: tuple[str, ...] = ("Camera + Skeleton", "Camera", "Skeleton")
+LAYOUT_MODES: tuple[str, ...] = ("Split View", "Focus Camera", "Focus Settings")
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,20 @@ GESTURE_GUIDE: tuple[tuple[str, str, str], ...] = (
     ("FIST", "Curl all fingers in", "Immediate pause and drag release"),
     ("SWIPE_LEFT", "Quick horizontal sweep to left", "Mapped command action"),
     ("SWIPE_RIGHT", "Quick horizontal sweep to right", "Mapped command action"),
+)
+
+
+HUD_FIELDS: tuple[tuple[str, str], ...] = (
+    ("status", "Status"),
+    ("state", "FSM State"),
+    ("gesture", "Gesture"),
+    ("confidence", "Confidence"),
+    ("pinch", "Pinch Strength"),
+    ("fps", "Engine FPS"),
+    ("hand", "Hand Present"),
+    ("idle", "Idle"),
+    ("swipe", "Swipe"),
+    ("kill", "Kill Switch"),
 )
 
 
@@ -158,7 +174,6 @@ def _apply_dark_title_bar(window: tk.Tk) -> None:
             if result == 0:
                 break
 
-        # Win11 caption colors: black title bar with light caption text.
         caption_color = ctypes.c_uint(0x000000)
         text_color = ctypes.c_uint(0xFFFFFF)
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -183,9 +198,12 @@ class PUnityRuntimeEngine:
         initial_profile: dict[str, Any],
         log_queue: queue.Queue[str],
         frame_queue: queue.Queue[Any],
+        hud_queue: queue.Queue[dict[str, Any]],
+        preview_mode: str = PREVIEW_MODES[0],
     ) -> None:
         self._log_queue = log_queue
         self._frame_queue = frame_queue
+        self._hud_queue = hud_queue
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -198,6 +216,9 @@ class PUnityRuntimeEngine:
         self._active_lock = threading.Lock()
         self._kill_switch_token = "f8"
         self._listener: keyboard.Listener | None = None
+
+        self._preview_mode_lock = threading.Lock()
+        self._preview_mode = preview_mode if preview_mode in PREVIEW_MODES else PREVIEW_MODES[0]
 
     @property
     def is_running(self) -> bool:
@@ -223,6 +244,16 @@ class PUnityRuntimeEngine:
             safety = self._profile_dict.get("safety", {})
             if isinstance(safety, dict):
                 self._kill_switch_token = str(safety.get("kill_switch_key", "f8")).strip().lower()
+
+    def set_preview_mode(self, mode: str) -> None:
+        if mode not in PREVIEW_MODES:
+            return
+        with self._preview_mode_lock:
+            self._preview_mode = mode
+
+    def _get_preview_mode(self) -> str:
+        with self._preview_mode_lock:
+            return self._preview_mode
 
     def _read_profile_snapshot(self) -> tuple[dict[str, Any], int]:
         with self._config_lock:
@@ -261,6 +292,19 @@ class PUnityRuntimeEngine:
                 self._frame_queue.put_nowait(frame_bgr)
             except queue.Full:
                 pass
+
+    def _push_hud(self, payload: dict[str, Any]) -> None:
+        try:
+            self._hud_queue.put_nowait(payload)
+        except queue.Full:
+            try:
+                self._hud_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._hud_queue.put_nowait(payload)
+            except queue.Full:
+                pass
     def _run(self) -> None:
         camera: CameraCapture | None = None
         detector = None
@@ -273,11 +317,12 @@ class PUnityRuntimeEngine:
         profile_version = 0
         fps = 0.0
         last_t = time.monotonic()
+        target_loop_hz = 75.0
 
         from punity.perception.hands import HandsDetector
 
         def rebuild_pipeline(raw_profile: dict[str, Any]) -> AppProfile:
-            nonlocal camera, detector, recognizer, hand_state, fsm, dispatcher, cursor_filter
+            nonlocal camera, detector, recognizer, hand_state, fsm, dispatcher, cursor_filter, target_loop_hz
 
             parsed = _profile_from_dict(raw_profile)
 
@@ -286,12 +331,14 @@ class PUnityRuntimeEngine:
             if detector is not None:
                 detector.close()
 
+            target_loop_hz = float(max(45, min(90, parsed.camera.fps)))
+
             camera = CameraCapture(
                 CameraConfig(
                     device_index=parsed.camera.device_index,
                     width=parsed.camera.width,
                     height=parsed.camera.height,
-                    fps=parsed.camera.fps,
+                    fps=int(target_loop_hz),
                 )
             )
             detector = HandsDetector(
@@ -332,7 +379,7 @@ class PUnityRuntimeEngine:
                 cursor_filter = EMAFilter2D(alpha=parsed.cursor.smoothing)
             else:
                 cursor_filter = OneEuroFilter2D(
-                    freq=max(5.0, float(parsed.camera.fps)),
+                    freq=max(5.0, target_loop_hz),
                     min_cutoff=max(0.5, parsed.cursor.smoothing * 4.0),
                     beta=0.02,
                     d_cutoff=1.2,
@@ -350,6 +397,8 @@ class PUnityRuntimeEngine:
             profile = rebuild_pipeline(raw_profile)
 
             while not self._stop_event.is_set():
+                loop_start = time.monotonic()
+
                 raw_profile, next_ver = self._read_profile_snapshot()
                 if next_ver != profile_version:
                     profile = rebuild_pipeline(raw_profile)
@@ -392,17 +441,38 @@ class PUnityRuntimeEngine:
                     if fps <= 0.0:
                         fps = instant
                     else:
-                        fps = fps * 0.9 + instant * 0.1
+                        fps = fps * 0.88 + instant * 0.12
 
-                draw_overlay(
-                    frame_bgr=frame_bgr,
-                    state=fsm.state,
-                    gesture=gesture,
-                    fps=fps,
-                    active=self._is_active(),
-                    idle=hand_status.idle,
+                preview_mode = self._get_preview_mode()
+                if preview_mode == "Skeleton":
+                    preview_frame = frame_bgr.copy()
+                    preview_frame[:] = 0
+                else:
+                    preview_frame = frame_bgr.copy()
+
+                if observation is not None and preview_mode in ("Camera + Skeleton", "Skeleton"):
+                    draw_hand_skeleton(preview_frame, observation)
+
+                self._push_frame(preview_frame)
+                self._push_hud(
+                    {
+                        "status": "ACTIVE" if self._is_active() else "PAUSED",
+                        "state": fsm.state.value,
+                        "gesture": gesture.label.value,
+                        "confidence": float(gesture.confidence),
+                        "pinch": float(gesture.pinch_strength),
+                        "fps": float(fps),
+                        "hand": bool(hand_status.present),
+                        "idle": bool(hand_status.idle),
+                        "swipe": gesture.swipe or "-",
+                        "kill": self._kill_switch_token.upper(),
+                    }
                 )
-                self._push_frame(frame_bgr)
+
+                target_dt = 1.0 / target_loop_hz
+                remaining = target_dt - (time.monotonic() - loop_start)
+                if remaining > 0:
+                    time.sleep(remaining)
 
         except Exception as exc:
             self._log_queue.put(f"Engine error: {exc}")
@@ -414,6 +484,21 @@ class PUnityRuntimeEngine:
                 camera.release()
             if detector is not None:
                 detector.close()
+
+            self._push_hud(
+                {
+                    "status": "IDLE",
+                    "state": "IDLE",
+                    "gesture": "NONE",
+                    "confidence": 0.0,
+                    "pinch": 0.0,
+                    "fps": 0.0,
+                    "hand": False,
+                    "idle": False,
+                    "swipe": "-",
+                    "kill": self._kill_switch_token.upper(),
+                }
+            )
             self._log_queue.put("Engine stopped")
 
 
@@ -430,8 +515,8 @@ class PUnityControlApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("PUnity Control Console")
-        self.geometry("1520x940")
-        self.minsize(1220, 800)
+        self.geometry("1600x900")
+        self.minsize(1280, 720)
         self.configure(bg=self.BG)
 
         self._profile_data: dict[str, Any] = {}
@@ -441,22 +526,33 @@ class PUnityControlApp(tk.Tk):
 
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._frame_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
+        self._hud_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         self._engine: PUnityRuntimeEngine | None = None
+
+        self._body: tk.Frame | None = None
+        self._left_col: tk.Frame | None = None
+        self._right_col: tk.Frame | None = None
 
         self.profile_name_var = tk.StringVar(value="default.json")
         self.runtime_status_var = tk.StringVar(value="IDLE")
+        self.preview_mode_var = tk.StringVar(value=PREVIEW_MODES[0])
+        self.layout_mode_var = tk.StringVar(value=LAYOUT_MODES[0])
+
+        self.hud_vars: dict[str, tk.StringVar] = {
+            key: tk.StringVar(value="--") for key, _label in HUD_FIELDS
+        }
 
         self._configure_ttk()
         self._build_layout()
         self._set_runtime_status("IDLE", good=False)
+        self._reset_hud_panel()
 
         self._refresh_profile_list()
         self._load_profile_into_editor(self.profile_name_var.get())
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.after(120, self._poll_runtime)
+        self.after(16, self._poll_runtime)
         self.after(50, lambda: _apply_dark_title_bar(self))
-
     def _configure_ttk(self) -> None:
         style = ttk.Style()
         style.theme_use("clam")
@@ -500,6 +596,34 @@ class PUnityControlApp(tk.Tk):
         )
         self.status_chip.pack(side="left", padx=(0, 10))
 
+        tk.Label(status_frame, text="Preview", bg=self.BG, fg=self.TEXT, font=("Consolas", 9)).pack(
+            side="left", padx=(0, 6)
+        )
+        preview_combo = ttk.Combobox(
+            status_frame,
+            textvariable=self.preview_mode_var,
+            values=PREVIEW_MODES,
+            state="readonly",
+            style="PUnity.TCombobox",
+            width=20,
+        )
+        preview_combo.pack(side="left", padx=(0, 10))
+        preview_combo.bind("<<ComboboxSelected>>", self._on_preview_mode_changed)
+
+        tk.Label(status_frame, text="Layout", bg=self.BG, fg=self.TEXT, font=("Consolas", 9)).pack(
+            side="left", padx=(0, 6)
+        )
+        layout_combo = ttk.Combobox(
+            status_frame,
+            textvariable=self.layout_mode_var,
+            values=LAYOUT_MODES,
+            state="readonly",
+            style="PUnity.TCombobox",
+            width=18,
+        )
+        layout_combo.pack(side="left", padx=(0, 10))
+        layout_combo.bind("<<ComboboxSelected>>", self._on_layout_mode_changed)
+
         self.start_btn = self._make_button(status_frame, "Start Engine", self._on_start_engine)
         self.start_btn.pack(side="left", padx=(0, 8))
         self.stop_btn = self._make_button(status_frame, "Stop Engine", self._on_stop_engine, warn=True)
@@ -509,20 +633,20 @@ class PUnityControlApp(tk.Tk):
         gestures_panel.pack(fill="x", padx=16, pady=(0, 10))
         self._build_gesture_toolbar(gestures_panel.content)
 
-        body = tk.Frame(self, bg=self.BG)
-        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-        body.grid_columnconfigure(0, weight=3)
-        body.grid_columnconfigure(1, weight=2)
-        body.grid_rowconfigure(0, weight=1)
+        self._body = tk.Frame(self, bg=self.BG)
+        self._body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self._body.grid_columnconfigure(0, weight=3)
+        self._body.grid_columnconfigure(1, weight=2)
+        self._body.grid_rowconfigure(0, weight=1)
 
-        left_col = tk.Frame(body, bg=self.BG)
-        left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        left_col.grid_rowconfigure(0, weight=4)
-        left_col.grid_rowconfigure(1, weight=1)
-        left_col.grid_rowconfigure(2, weight=2)
-        left_col.grid_columnconfigure(0, weight=1)
+        self._left_col = tk.Frame(self._body, bg=self.BG)
+        self._left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self._left_col.grid_rowconfigure(0, weight=4)
+        self._left_col.grid_rowconfigure(1, weight=1)
+        self._left_col.grid_rowconfigure(2, weight=2)
+        self._left_col.grid_columnconfigure(0, weight=1)
 
-        preview_panel = self._make_panel(left_col, "LIVE CAMERA + HUD")
+        preview_panel = self._make_panel(self._left_col, "LIVE CAMERA")
         preview_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
         preview_panel.content.grid_rowconfigure(0, weight=1)
         preview_panel.content.grid_columnconfigure(0, weight=1)
@@ -539,22 +663,12 @@ class PUnityControlApp(tk.Tk):
             highlightbackground=self.ACCENT,
         )
         self.preview_label.grid(row=0, column=0, sticky="nsew")
-        commands_panel = self._make_panel(left_col, "COMMANDS")
-        commands_panel.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
-        self.commands_text = tk.Text(
-            commands_panel.content,
-            bg=self.PANEL_ALT,
-            fg=self.ACCENT_SOFT,
-            insertbackground=self.ACCENT,
-            font=("Consolas", 10),
-            bd=0,
-            relief="flat",
-            wrap="word",
-        )
-        self.commands_text.pack(fill="both", expand=True)
-        self.commands_text.configure(state="disabled")
 
-        logs_panel = self._make_panel(left_col, "RUNTIME LOG")
+        hud_panel = self._make_panel(self._left_col, "HUD")
+        hud_panel.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        self._build_hud_panel(hud_panel.content)
+
+        logs_panel = self._make_panel(self._left_col, "RUNTIME LOG")
         logs_panel.grid(row=2, column=0, sticky="nsew")
         self.logs_text = ScrolledText(
             logs_panel.content,
@@ -570,18 +684,20 @@ class PUnityControlApp(tk.Tk):
         self.logs_text.pack(fill="both", expand=True)
         self.logs_text.configure(state="disabled")
 
-        right_col = tk.Frame(body, bg=self.BG)
-        right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-        right_col.grid_rowconfigure(1, weight=1)
-        right_col.grid_columnconfigure(0, weight=1)
+        self._right_col = tk.Frame(self._body, bg=self.BG)
+        self._right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self._right_col.grid_rowconfigure(1, weight=1)
+        self._right_col.grid_columnconfigure(0, weight=1)
 
-        profile_panel = self._make_panel(right_col, "PROFILE MANAGER")
+        profile_panel = self._make_panel(self._right_col, "PROFILE MANAGER")
         profile_panel.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         self._build_profile_manager(profile_panel.content)
 
-        settings_panel = self._make_panel(right_col, "SETTINGS")
+        settings_panel = self._make_panel(self._right_col, "SETTINGS")
         settings_panel.grid(row=1, column=0, sticky="nsew")
         self._build_settings_editor(settings_panel.content)
+
+        self._apply_layout_mode()
 
     def _make_button(self, parent: tk.Misc, text: str, command, warn: bool = False) -> tk.Button:
         fg = self.WARN if warn else self.ACCENT
@@ -672,6 +788,33 @@ class PUnityControlApp(tk.Tk):
             action_label.pack(fill="x")
             self._gesture_action_labels[name] = action_label
 
+    def _build_hud_panel(self, parent: tk.Frame) -> None:
+        for row, (key, label) in enumerate(HUD_FIELDS):
+            tk.Label(
+                parent,
+                text=label,
+                bg=self.PANEL,
+                fg=self.TEXT,
+                font=("Consolas", 10),
+                anchor="w",
+            ).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=2)
+
+            tk.Label(
+                parent,
+                textvariable=self.hud_vars[key],
+                bg=self.PANEL_ALT,
+                fg=self.ACCENT_SOFT,
+                font=("Consolas", 10, "bold"),
+                anchor="w",
+                padx=8,
+                pady=2,
+                relief="flat",
+                highlightthickness=1,
+                highlightbackground=self.ACCENT,
+            ).grid(row=row, column=1, sticky="ew", pady=2)
+
+        parent.grid_columnconfigure(1, weight=1)
+
     def _build_profile_manager(self, parent: tk.Frame) -> None:
         row = tk.Frame(parent, bg=self.PANEL)
         row.pack(fill="x")
@@ -704,7 +847,7 @@ class PUnityControlApp(tk.Tk):
 
     def _build_settings_editor(self, parent: tk.Frame) -> None:
         grid = tk.Frame(parent, bg=self.PANEL)
-        grid.pack(fill="x")
+        grid.pack(fill="both", expand=True)
 
         for row_idx, field in enumerate(SETTINGS_FIELDS):
             tk.Label(
@@ -752,33 +895,6 @@ class PUnityControlApp(tk.Tk):
             self._field_vars[(field.section, field.key)] = var
 
         grid.grid_columnconfigure(1, weight=1)
-
-        tk.Label(
-            parent,
-            text="Mappings JSON",
-            bg=self.PANEL,
-            fg=self.TEXT,
-            font=("Consolas", 10),
-            anchor="w",
-        ).pack(fill="x", pady=(10, 4))
-
-        self.mapping_text = ScrolledText(
-            parent,
-            bg=self.PANEL_ALT,
-            fg="#CFF4FF",
-            insertbackground=self.ACCENT,
-            font=("Consolas", 10),
-            bd=0,
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=self.ACCENT,
-            height=9,
-            wrap="none",
-        )
-        self.mapping_text.pack(fill="both", expand=True)
-        self.mapping_text.bind("<FocusOut>", lambda _e: self._auto_apply_live())
-        self.mapping_text.bind("<Control-Return>", lambda _e: (self._on_apply_live(), "break")[1])
-
     def _refresh_profile_list(self) -> None:
         PROFILES_DIR.mkdir(parents=True, exist_ok=True)
         names = sorted(path.name for path in PROFILES_DIR.glob("*.json"))
@@ -794,6 +910,7 @@ class PUnityControlApp(tk.Tk):
 
     def _on_profile_selected(self, _event=None) -> None:
         self._load_profile_into_editor(self.profile_name_var.get())
+
     def _load_profile_into_editor(self, profile_name: str) -> None:
         path = PROFILES_DIR / profile_name
         try:
@@ -806,9 +923,8 @@ class PUnityControlApp(tk.Tk):
 
         self._profile_data = data
         self._apply_profile_to_fields()
-        self._refresh_mappings_editor()
-        self._refresh_commands_panel()
         self._refresh_gesture_actions()
+        self._sync_hud_static_from_profile()
         self._append_log(f"Loaded profile {profile_name}")
 
         if self._engine is not None and self._engine.is_running:
@@ -831,14 +947,6 @@ class PUnityControlApp(tk.Tk):
             else:
                 var.set(str(value))
 
-    def _refresh_mappings_editor(self) -> None:
-        mappings = self._profile_data.get("mappings", {})
-        if not isinstance(mappings, dict):
-            mappings = {}
-
-        self.mapping_text.delete("1.0", tk.END)
-        self.mapping_text.insert("1.0", json.dumps(mappings, indent=2))
-
     def _collect_profile_from_fields(self) -> dict[str, Any]:
         data = json.loads(json.dumps(self._profile_data)) if self._profile_data else _default_profile_dict()
 
@@ -850,12 +958,6 @@ class PUnityControlApp(tk.Tk):
 
             var = self._field_vars[(field.section, field.key)]
             section[field.key] = self._coerce_field_value(field, var.get())
-
-        mappings_raw = self.mapping_text.get("1.0", tk.END).strip()
-        mappings = json.loads(mappings_raw) if mappings_raw else {}
-        if not isinstance(mappings, dict):
-            raise ValueError("Mappings JSON must be an object")
-        data["mappings"] = mappings
 
         return asdict(_profile_from_dict(data))
 
@@ -894,8 +996,8 @@ class PUnityControlApp(tk.Tk):
         path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
         self._profile_data = data
         self._refresh_profile_list()
-        self._refresh_commands_panel()
         self._refresh_gesture_actions()
+        self._sync_hud_static_from_profile()
 
         if self._engine is not None and self._engine.is_running:
             self._engine.update_profile(self._profile_data)
@@ -926,8 +1028,8 @@ class PUnityControlApp(tk.Tk):
             return
 
         self._profile_data = data
-        self._refresh_commands_panel()
         self._refresh_gesture_actions()
+        self._sync_hud_static_from_profile()
 
         if self._engine is not None and self._engine.is_running:
             self._engine.update_profile(self._profile_data)
@@ -943,8 +1045,8 @@ class PUnityControlApp(tk.Tk):
             return
 
         self._profile_data = data
-        self._refresh_commands_panel()
         self._refresh_gesture_actions()
+        self._sync_hud_static_from_profile()
         self._engine.update_profile(self._profile_data)
 
     def _refresh_gesture_actions(self) -> None:
@@ -957,37 +1059,6 @@ class PUnityControlApp(tk.Tk):
             else:
                 action_text = default_action
             label.configure(text=f"Action: {action_text}")
-
-    def _refresh_commands_panel(self) -> None:
-        safety = self._profile_data.get("safety", {})
-        mappings = self._profile_data.get("mappings", {})
-
-        kill = "F8"
-        if isinstance(safety, dict):
-            kill = str(safety.get("kill_switch_key", "f8")).upper()
-
-        lines = [
-            "SYSTEM COMMANDS",
-            f"  Kill Switch: {kill} (toggle active/pause)",
-            "  Stop Engine: Stop Engine button",
-            "",
-            "GESTURE COMMANDS",
-            "  OPEN_PALM  -> Enable pointer movement",
-            "  PINCHING   -> Mouse down / drag while held",
-            "  RELEASE    -> Mouse up",
-            "  FIST       -> Pause movement and release drag",
-            f"  SWIPE_LEFT -> {self._format_mapping_action('SWIPE_LEFT', mappings)}",
-            f"  SWIPE_RIGHT-> {self._format_mapping_action('SWIPE_RIGHT', mappings)}",
-            "",
-            "NOTES",
-            "  HUD and webcam preview are embedded in this GUI.",
-            "  Settings support live apply while engine runs.",
-        ]
-
-        self.commands_text.configure(state="normal")
-        self.commands_text.delete("1.0", tk.END)
-        self.commands_text.insert("1.0", "\n".join(lines))
-        self.commands_text.configure(state="disabled")
 
     def _format_mapping_action(self, gesture: str, mappings: dict[str, Any] | None = None) -> str:
         if mappings is None:
@@ -1004,7 +1075,6 @@ class PUnityControlApp(tk.Tk):
             combo = "+".join(str(k).upper() for k in keys)
             return f"{event_name}: {combo}"
         return event_name
-
     def _on_start_engine(self) -> None:
         if self._engine is not None and self._engine.is_running:
             return
@@ -1015,7 +1085,13 @@ class PUnityControlApp(tk.Tk):
             messagebox.showerror("Start Error", f"Cannot start engine:\n{exc}")
             return
 
-        self._engine = PUnityRuntimeEngine(self._profile_data, self._log_queue, self._frame_queue)
+        self._engine = PUnityRuntimeEngine(
+            self._profile_data,
+            self._log_queue,
+            self._frame_queue,
+            self._hud_queue,
+            preview_mode=self.preview_mode_var.get(),
+        )
         self._engine.start()
         self._set_runtime_status("RUNNING", good=True)
         self._append_log("Engine started")
@@ -1029,6 +1105,38 @@ class PUnityControlApp(tk.Tk):
         self._set_runtime_status("IDLE", good=False)
         self._append_log("Engine stop requested")
         self.preview_label.configure(image="", text="Engine stopped")
+        self._reset_hud_panel()
+
+    def _on_preview_mode_changed(self, _event=None) -> None:
+        if self._engine is not None and self._engine.is_running:
+            self._engine.set_preview_mode(self.preview_mode_var.get())
+
+    def _on_layout_mode_changed(self, _event=None) -> None:
+        self._apply_layout_mode()
+
+    def _apply_layout_mode(self) -> None:
+        if self._body is None or self._left_col is None or self._right_col is None:
+            return
+
+        mode = self.layout_mode_var.get()
+        if mode == "Focus Camera":
+            self._right_col.grid_remove()
+            self._left_col.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 0))
+            self._body.grid_columnconfigure(0, weight=1)
+            self._body.grid_columnconfigure(1, weight=0)
+            return
+
+        if mode == "Focus Settings":
+            self._left_col.grid_remove()
+            self._right_col.grid(row=0, column=0, columnspan=2, sticky="nsew", padx=(0, 0))
+            self._body.grid_columnconfigure(0, weight=1)
+            self._body.grid_columnconfigure(1, weight=0)
+            return
+
+        self._left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self._right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self._body.grid_columnconfigure(0, weight=3)
+        self._body.grid_columnconfigure(1, weight=2)
 
     def _poll_runtime(self) -> None:
         while True:
@@ -1045,14 +1153,24 @@ class PUnityControlApp(tk.Tk):
             except queue.Empty:
                 break
 
+        latest_hud = None
+        while True:
+            try:
+                latest_hud = self._hud_queue.get_nowait()
+            except queue.Empty:
+                break
+
         if latest_frame is not None:
             self._render_preview(latest_frame)
+
+        if latest_hud is not None:
+            self._update_hud_panel(latest_hud)
 
         if self._engine is not None and not self._engine.is_running:
             self._engine = None
             self._set_runtime_status("IDLE", good=False)
 
-        self.after(90, self._poll_runtime)
+        self.after(16, self._poll_runtime)
 
     def _render_preview(self, frame_bgr) -> None:
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -1081,6 +1199,51 @@ class PUnityControlApp(tk.Tk):
             self.status_chip.configure(bg="#11351f", fg=self.GOOD, highlightbackground=self.GOOD)
         else:
             self.status_chip.configure(bg="#3a2512", fg=self.WARN, highlightbackground=self.WARN)
+
+    def _reset_hud_panel(self) -> None:
+        self.hud_vars["status"].set("IDLE")
+        self.hud_vars["state"].set("IDLE")
+        self.hud_vars["gesture"].set("NONE")
+        self.hud_vars["confidence"].set("0.00")
+        self.hud_vars["pinch"].set("0.00")
+        self.hud_vars["fps"].set("0.0")
+        self.hud_vars["hand"].set("NO")
+        self.hud_vars["idle"].set("NO")
+        self.hud_vars["swipe"].set("-")
+        self.hud_vars["kill"].set("F8")
+
+    def _sync_hud_static_from_profile(self) -> None:
+        safety = self._profile_data.get("safety", {})
+        if isinstance(safety, dict):
+            token = str(safety.get("kill_switch_key", "f8")).strip().upper()
+            self.hud_vars["kill"].set(token)
+
+    def _update_hud_panel(self, hud: dict[str, Any]) -> None:
+        self.hud_vars["status"].set(str(hud.get("status", "--")))
+        self.hud_vars["state"].set(str(hud.get("state", "--")))
+        self.hud_vars["gesture"].set(str(hud.get("gesture", "--")))
+
+        try:
+            self.hud_vars["confidence"].set(f"{float(hud.get('confidence', 0.0)):.2f}")
+        except Exception:
+            self.hud_vars["confidence"].set("0.00")
+
+        try:
+            self.hud_vars["pinch"].set(f"{float(hud.get('pinch', 0.0)):.2f}")
+        except Exception:
+            self.hud_vars["pinch"].set("0.00")
+
+        try:
+            self.hud_vars["fps"].set(f"{float(hud.get('fps', 0.0)):.1f}")
+        except Exception:
+            self.hud_vars["fps"].set("0.0")
+
+        self.hud_vars["hand"].set("YES" if bool(hud.get("hand", False)) else "NO")
+        self.hud_vars["idle"].set("YES" if bool(hud.get("idle", False)) else "NO")
+        self.hud_vars["swipe"].set(str(hud.get("swipe", "-")))
+
+        kill = str(hud.get("kill", self.hud_vars["kill"].get()))
+        self.hud_vars["kill"].set(kill)
 
     def _on_close(self) -> None:
         if self._engine is not None:

@@ -79,6 +79,7 @@ class GestureMouseApp:
         self._last_frame_t = time.monotonic()
         self._kill_switch_token = profile.safety.kill_switch_key.lower().strip()
         self._listener = keyboard.Listener(on_press=self._on_key_press)
+        self._target_loop_hz = float(max(45, min(90, profile.camera.fps)))
 
     def _on_key_press(self, key) -> None:
         if _key_matches(key, self._kill_switch_token):
@@ -89,6 +90,7 @@ class GestureMouseApp:
         self._listener.start()
         try:
             while True:
+                loop_start = time.monotonic()
                 frame_bgr, t_ms = self._camera.read_frame()
                 if self._profile.overlay.mirror_preview:
                     frame_bgr = cv2.flip(frame_bgr, 1)
@@ -125,6 +127,11 @@ class GestureMouseApp:
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     break
+
+                target_dt = 1.0 / self._target_loop_hz
+                remaining = target_dt - (time.monotonic() - loop_start)
+                if remaining > 0:
+                    time.sleep(remaining)
 
         finally:
             self._listener.stop()

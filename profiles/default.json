@@ -20,14 +20,14 @@
   },
   "swipe": {
     "enabled": true,
-    "velocity_threshold": 1.7,
+    "velocity_threshold": 1.15,
     "cooldown_ms": 850
   },
   "camera": {
     "device_index": 0,
     "width": 1280,
     "height": 720,
-    "fps": 60
+    "fps": 75
   },
   "overlay": {
     "enabled": true,
@@ -54,3 +54,4 @@
     }
   }
 }
+
