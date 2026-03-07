@@ -68,25 +68,23 @@ SETTINGS_FIELDS: tuple[SettingField, ...] = (
     SettingField("cursor", "accel", "Cursor Accel", "float"),
     SettingField("cursor", "smoothing", "Cursor Smoothing", "float"),
     SettingField("cursor", "deadzone_px", "Deadzone Pixels", "float"),
+    SettingField("cursor", "edge_padding_px", "Edge Padding (px)", "float"),
     SettingField("camera", "width", "Camera Width", "int"),
     SettingField("camera", "height", "Camera Height", "int"),
     SettingField("camera", "fps", "Camera FPS", "int"),
     SettingField("safety", "kill_switch_key", "Kill Switch Key", "str"),
     SettingField("safety", "idle_timeout_ms", "Idle Timeout (ms)", "int"),
-    SettingField("safety", "require_open_palm", "Require Open Palm", "bool"),
-    SettingField("swipe", "enabled", "Enable Swipe", "bool"),
-    SettingField("swipe", "velocity_threshold", "Swipe Velocity", "float"),
-    SettingField("swipe", "cooldown_ms", "Swipe Cooldown (ms)", "int"),
+    SettingField("safety", "require_open_palm", "Require Pointer", "bool"),
 )
 
 
 GESTURE_GUIDE: tuple[tuple[str, str, str], ...] = (
-    ("OPEN_PALM", "Spread fingers and face palm to camera", "Enable pointing + move cursor"),
-    ("PINCHING", "Touch thumb tip to index tip", "Mouse down and drag while held"),
+    ("POINTER", "Raise index finger and curl remaining fingers", "Enable pointing + move cursor"),
+    ("PINCHING", "Touch thumb tip to index tip", "Single click (200ms cooldown)"),
+    ("SCROLL", "Hold index+middle up for up scroll, point them down for down scroll", "Continuous scroll while held"),
+    ("PINKY_DRAG", "Raise index + pinky fingers", "Mouse down and drag while held"),
     ("FIST", "Curl all fingers in", "Immediate pause and drag release"),
     ("FINGERS_CROSSED", "Cross index and middle fingers", "Toggle pause/resume controls"),
-    ("SWIPE_LEFT", "Quick horizontal sweep to left", "Mapped command action"),
-    ("SWIPE_RIGHT", "Quick horizontal sweep to right", "Mapped command action"),
 )
 
 
@@ -99,7 +97,6 @@ HUD_FIELDS: tuple[tuple[str, str], ...] = (
     ("fps", "Engine FPS"),
     ("hand", "Hand Present"),
     ("idle", "Idle"),
-    ("swipe", "Swipe"),
     ("kill", "Kill Switch"),
 )
 
@@ -122,18 +119,7 @@ def _default_profile_dict() -> dict[str, Any]:
         swipe=SwipeProfile(),
         camera=CameraProfile(),
         overlay=OverlayProfile(),
-        mappings={
-            "SWIPE_LEFT": {
-                "event": "HOTKEY",
-                "keys": ["cmd", "ctrl", "left"],
-                "cooldown_ms": 1200,
-            },
-            "SWIPE_RIGHT": {
-                "event": "HOTKEY",
-                "keys": ["cmd", "ctrl", "right"],
-                "cooldown_ms": 1200,
-            },
-        },
+        mappings={},
     )
     return asdict(profile)
 
@@ -321,6 +307,8 @@ class PUnityRuntimeEngine:
         last_t = time.monotonic()
         target_loop_hz = 30.0
         crossed_latch = False
+        cross_hold_start_ms: int | None = None
+        cross_last_toggle_ms = -10000
 
         from punity.perception.hands import HandsDetector
 
@@ -354,9 +342,6 @@ class PUnityRuntimeEngine:
                     pinch_on=parsed.thresholds.pinch_on,
                     pinch_off=parsed.thresholds.pinch_off,
                     min_confidence=parsed.thresholds.min_confidence,
-                    swipe_enabled=parsed.swipe.enabled,
-                    swipe_velocity_threshold=parsed.swipe.velocity_threshold,
-                    swipe_cooldown_ms=parsed.swipe.cooldown_ms,
                 )
             )
             hand_state = HandStateTracker(
@@ -375,6 +360,7 @@ class PUnityRuntimeEngine:
                     sensitivity=parsed.cursor.sensitivity,
                     accel=parsed.cursor.accel,
                     deadzone_px=parsed.cursor.deadzone_px,
+                    edge_padding_px=parsed.cursor.edge_padding_px,
                 )
             )
 
@@ -430,10 +416,17 @@ class PUnityRuntimeEngine:
 
                 gesture = recognizer.recognize(observation, t_ms)
                 if gesture.label == GestureLabel.FINGERS_CROSSED:
-                    if not crossed_latch:
+                    if cross_hold_start_ms is None:
+                        cross_hold_start_ms = t_ms
+
+                    hold_elapsed = t_ms - cross_hold_start_ms
+                    cooldown_elapsed = t_ms - cross_last_toggle_ms
+                    if hold_elapsed >= 400 and cooldown_elapsed >= 1000 and not crossed_latch:
                         self._toggle_active("Fingers crossed")
-                    crossed_latch = True
+                        crossed_latch = True
+                        cross_last_toggle_ms = t_ms
                 else:
+                    cross_hold_start_ms = None
                     crossed_latch = False
 
                 if gesture.cursor_point_norm is not None:
@@ -479,7 +472,6 @@ class PUnityRuntimeEngine:
                         "fps": float(fps),
                         "hand": bool(hand_status.present),
                         "idle": bool(hand_status.idle),
-                        "swipe": gesture.swipe or "-",
                         "kill": self._kill_switch_token.upper(),
                     }
                 )
@@ -507,7 +499,6 @@ class PUnityRuntimeEngine:
                     "fps": 0.0,
                     "hand": False,
                     "idle": False,
-                    "swipe": "-",
                     "kill": self._kill_switch_token.upper(),
                 }
             )
@@ -534,6 +525,7 @@ class PUnityControlApp(tk.Tk):
         self._profile_data: dict[str, Any] = {}
         self._field_vars: dict[tuple[str, str], tk.Variable] = {}
         self._gesture_action_labels: dict[str, tk.Label] = {}
+        self._hud_value_labels: dict[str, tk.Label] = {}
         self._preview_photo: ImageTk.PhotoImage | None = None
 
         self._log_queue: queue.Queue[str] = queue.Queue()
@@ -846,14 +838,18 @@ class PUnityControlApp(tk.Tk):
                 anchor="w",
             ).pack(anchor="w")
 
-            tk.Label(
+            value_width = 18 if key == "gesture" else 10
+            value_label = tk.Label(
                 card,
                 textvariable=self.hud_vars[key],
                 bg=self.PANEL_ALT,
                 fg=self.ACCENT_SOFT,
                 font=("Consolas", 9, "bold"),
                 anchor="w",
-            ).pack(anchor="w", pady=(2, 0))
+                width=value_width,
+            )
+            value_label.pack(anchor="w", pady=(2, 0))
+            self._hud_value_labels[key] = value_label
 
     def _build_profile_manager(self, parent: tk.Frame) -> None:
         row = tk.Frame(parent, bg=self.PANEL)
@@ -1143,18 +1139,12 @@ class PUnityControlApp(tk.Tk):
         self._refresh_gesture_actions()
         self._sync_hud_static_from_profile()
         self._engine.update_profile(self._profile_data)
-
     def _refresh_gesture_actions(self) -> None:
         for gesture_name, _how, default_action in GESTURE_GUIDE:
             label = self._gesture_action_labels.get(gesture_name)
             if label is None:
                 continue
-            if gesture_name.startswith("SWIPE"):
-                action_text = self._format_mapping_action(gesture_name)
-            else:
-                action_text = default_action
-            label.configure(text=f"Action: {action_text}")
-
+            label.configure(text=f"Action: {default_action}")
     def _format_mapping_action(self, gesture: str, mappings: dict[str, Any] | None = None) -> str:
         if mappings is None:
             raw = self._profile_data.get("mappings", {})
@@ -1309,8 +1299,11 @@ class PUnityControlApp(tk.Tk):
         self.hud_vars["fps"].set("0.0")
         self.hud_vars["hand"].set("NO")
         self.hud_vars["idle"].set("NO")
-        self.hud_vars["swipe"].set("-")
         self.hud_vars["kill"].set("F8")
+
+        status_label = self._hud_value_labels.get("status")
+        if status_label is not None:
+            status_label.configure(fg=self.ACCENT_SOFT)
 
     def _sync_hud_static_from_profile(self) -> None:
         safety = self._profile_data.get("safety", {})
@@ -1319,7 +1312,13 @@ class PUnityControlApp(tk.Tk):
             self.hud_vars["kill"].set(token)
 
     def _update_hud_panel(self, hud: dict[str, Any]) -> None:
-        self.hud_vars["status"].set(str(hud.get("status", "--")))
+        status_text = str(hud.get("status", "--"))
+        self.hud_vars["status"].set(status_text)
+
+        status_label = self._hud_value_labels.get("status")
+        if status_label is not None:
+            status_fg = self.WARN if status_text.upper() == "PAUSED" else self.ACCENT_SOFT
+            status_label.configure(fg=status_fg)
         self.hud_vars["state"].set(str(hud.get("state", "--")))
         self.hud_vars["gesture"].set(str(hud.get("gesture", "--")))
 
@@ -1340,7 +1339,6 @@ class PUnityControlApp(tk.Tk):
 
         self.hud_vars["hand"].set("YES" if bool(hud.get("hand", False)) else "NO")
         self.hud_vars["idle"].set("YES" if bool(hud.get("idle", False)) else "NO")
-        self.hud_vars["swipe"].set(str(hud.get("swipe", "-")))
 
         kill = str(hud.get("kill", self.hud_vars["kill"].get()))
         self.hud_vars["kill"].set(kill)

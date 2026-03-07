@@ -7,6 +7,10 @@ from typing import Any
 
 class GestureLabel(str, Enum):
     NONE = "NONE"
+    POINTER = "POINTER"
+    PINKY_DRAG = "PINKY_DRAG"
+    SCROLL_UP = "SCROLL_UP"
+    SCROLL_DOWN = "SCROLL_DOWN"
     OPEN_PALM = "OPEN_PALM"
     PINCHING = "PINCHING"
     FIST = "FIST"
@@ -27,6 +31,7 @@ class EventType(str, Enum):
     MOVE_CURSOR = "MOVE_CURSOR"
     MOUSE_DOWN_LEFT = "MOUSE_DOWN_LEFT"
     MOUSE_UP_LEFT = "MOUSE_UP_LEFT"
+    SCROLL = "SCROLL"
     HOTKEY = "HOTKEY"
     TOGGLE_ACTIVE = "TOGGLE_ACTIVE"
 

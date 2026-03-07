@@ -23,6 +23,10 @@ class GestureFeatures:
     pinch_distance_norm: float
     pinch_strength: float
     finger_extended: dict[str, bool]
+    is_pointer: bool
+    is_pinky_drag: bool
+    is_scroll_up_pose: bool
+    is_scroll_down_pose: bool
     is_open_palm: bool
     is_fist: bool
     is_fingers_crossed: bool
@@ -104,7 +108,45 @@ def compute_features(obs: HandObservation) -> GestureFeatures:
     }
     extended_count = sum(1 for v in extended.values() if v)
 
-    # Require a reasonably open spread to avoid false OPEN_PALM while transitioning.
+    # Pointer gesture: index extended, remaining three fingers curled.
+    is_pointer = (
+        index_extended
+        and not middle_extended
+        and not ring_extended
+        and not pinky_extended
+        and pinch_distance_norm > 0.38
+        and not is_fingers_crossed
+    )
+
+    # Pinky drag gesture: index + pinky extended, middle + ring curled.
+    is_pinky_drag = (
+        index_extended
+        and pinky_extended
+        and not middle_extended
+        and not ring_extended
+        and pinch_distance_norm > 0.40
+        and not is_fingers_crossed
+    )
+
+    # Scroll pose base: index + middle outstretched, ring + pinky curled.
+    scroll_base_pose = (
+        index_extended
+        and middle_extended
+        and not ring_extended
+        and not pinky_extended
+        and pinch_distance_norm > 0.42
+        and not is_fingers_crossed
+    )
+
+    # Direction from finger orientation in image space:
+    # up => fingertip y above PIP y; down => fingertip y below PIP y.
+    avg_tip_y = (index.y + middle.y) * 0.5
+    avg_pip_y = (lm[INDEX_PIP].y + lm[MIDDLE_PIP].y) * 0.5
+    orient_delta = avg_tip_y - avg_pip_y
+    is_scroll_up_pose = scroll_base_pose and orient_delta < -0.02
+    is_scroll_down_pose = scroll_base_pose and orient_delta > 0.02
+
+    # Retained for compatibility/debugging.
     is_open_palm = (
         extended_count >= 4
         and index_extended
@@ -125,6 +167,10 @@ def compute_features(obs: HandObservation) -> GestureFeatures:
         pinch_distance_norm=pinch_distance_norm,
         pinch_strength=pinch_strength,
         finger_extended=extended,
+        is_pointer=is_pointer,
+        is_pinky_drag=is_pinky_drag,
+        is_scroll_up_pose=is_scroll_up_pose,
+        is_scroll_down_pose=is_scroll_down_pose,
         is_open_palm=is_open_palm,
         is_fist=is_fist,
         is_fingers_crossed=is_fingers_crossed,

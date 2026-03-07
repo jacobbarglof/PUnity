@@ -21,6 +21,7 @@ class CursorProfile:
     smoothing: float = 0.35
     filter: str = "one_euro"
     deadzone_px: float = 3.0
+    edge_padding_px: float = 80.0
 
 
 @dataclass(slots=True)
@@ -32,7 +33,7 @@ class SafetyProfile:
 
 @dataclass(slots=True)
 class SwipeProfile:
-    enabled: bool = True
+    enabled: bool = False
     velocity_threshold: float = 1.15
     cooldown_ms: int = 850
 
@@ -62,20 +63,7 @@ class AppProfile:
     mappings: dict[str, dict[str, object]] = field(default_factory=dict)
 
 
-_DEFAULT = AppProfile(
-    mappings={
-        "SWIPE_LEFT": {
-            "event": "HOTKEY",
-            "keys": ["cmd", "ctrl", "left"],
-            "cooldown_ms": 1200,
-        },
-        "SWIPE_RIGHT": {
-            "event": "HOTKEY",
-            "keys": ["cmd", "ctrl", "right"],
-            "cooldown_ms": 1200,
-        },
-    }
-)
+_DEFAULT = AppProfile(mappings={})
 
 
 def _merge(dst: dict, src: dict) -> dict:

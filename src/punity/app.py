@@ -41,9 +41,6 @@ class GestureMouseApp:
                 pinch_on=profile.thresholds.pinch_on,
                 pinch_off=profile.thresholds.pinch_off,
                 min_confidence=profile.thresholds.min_confidence,
-                swipe_enabled=profile.swipe.enabled,
-                swipe_velocity_threshold=profile.swipe.velocity_threshold,
-                swipe_cooldown_ms=profile.swipe.cooldown_ms,
             )
         )
         self._hand_state = HandStateTracker(
@@ -62,6 +59,7 @@ class GestureMouseApp:
                 sensitivity=profile.cursor.sensitivity,
                 accel=profile.cursor.accel,
                 deadzone_px=profile.cursor.deadzone_px,
+                edge_padding_px=profile.cursor.edge_padding_px,
             )
         )
 
@@ -77,6 +75,8 @@ class GestureMouseApp:
 
         self._active = True
         self._crossed_latch = False
+        self._cross_hold_start_ms: int | None = None
+        self._cross_last_toggle_ms = -10000
         self._fps = 0.0
         self._last_frame_t = time.monotonic()
         self._kill_switch_token = profile.safety.kill_switch_key.lower().strip()
@@ -109,10 +109,17 @@ class GestureMouseApp:
 
                 gesture = self._recognizer.recognize(observation, t_ms)
                 if gesture.label == GestureLabel.FINGERS_CROSSED:
-                    if not self._crossed_latch:
+                    if self._cross_hold_start_ms is None:
+                        self._cross_hold_start_ms = t_ms
+
+                    hold_elapsed = t_ms - self._cross_hold_start_ms
+                    cooldown_elapsed = t_ms - self._cross_last_toggle_ms
+                    if hold_elapsed >= 400 and cooldown_elapsed >= 1000 and not self._crossed_latch:
                         self._toggle_active()
-                    self._crossed_latch = True
+                        self._crossed_latch = True
+                        self._cross_last_toggle_ms = t_ms
                 else:
+                    self._cross_hold_start_ms = None
                     self._crossed_latch = False
 
                 if gesture.cursor_point_norm is not None:
