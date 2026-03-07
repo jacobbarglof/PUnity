@@ -1,4 +1,4 @@
-# PUnity
+# Unity
 
 PUnity is a Windows 11 desktop app that tracks one hand from a webcam and turns a small, reliable gesture set into mouse/keyboard actions.
 
