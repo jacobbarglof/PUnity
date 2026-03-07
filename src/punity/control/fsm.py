@@ -13,6 +13,7 @@ class ControlConfig:
     hotkey_cooldown_ms: int
     pinch_click_cooldown_ms: int = 200
     scroll_repeat_ms: int = 80
+    pinky_drag_release_grace_ms: int = 140
 
 
 @dataclass
@@ -25,6 +26,7 @@ class ControlFSM:
     _last_hotkey_ms: dict[str, int] = field(default_factory=dict)
     _last_pinch_click_ms: int = -10000
     _last_scroll_emit_ms: int = -10000
+    _last_pinky_drag_ms: int = -10000
 
     def set_active(self, active: bool) -> None:
         self.active = active
@@ -63,8 +65,16 @@ class ControlFSM:
             self._last_label = gesture.label
             return events
 
+        is_pinky_frame = gesture.label == GestureLabel.PINKY_DRAG
+        if is_pinky_frame:
+            self._last_pinky_drag_ms = t_ms
+
+        drag_active = is_pinky_frame or (
+            self._mouse_down and (t_ms - self._last_pinky_drag_ms) <= self.config.pinky_drag_release_grace_ms
+        )
+
         if self.config.require_open_palm:
-            can_point = gesture.label in (GestureLabel.POINTER, GestureLabel.PINCHING, GestureLabel.PINKY_DRAG)
+            can_point = gesture.label in (GestureLabel.POINTER, GestureLabel.PINCHING) or drag_active
         else:
             can_point = gesture.label != GestureLabel.FIST
 
@@ -77,8 +87,8 @@ class ControlFSM:
             )
             self.state = AppState.POINTING
 
-        # Pinky gesture drives click-and-hold drag.
-        if gesture.label == GestureLabel.PINKY_DRAG:
+        # Pinky gesture drives click-and-hold drag with short release grace to absorb tracking jitter.
+        if drag_active:
             if not self._mouse_down:
                 self._mouse_down = True
                 events.append(ControlEvent(event_type=EventType.MOUSE_DOWN_LEFT))
@@ -91,9 +101,9 @@ class ControlFSM:
             else:
                 self.state = AppState.ARMED
 
-        # Pinch is a debounced click (not hold).
+        # Pinch is a debounced click (not hold), disabled while drag is active.
         pinch_edge = gesture.label == GestureLabel.PINCHING and self._last_label != GestureLabel.PINCHING
-        if pinch_edge and (t_ms - self._last_pinch_click_ms) >= self.config.pinch_click_cooldown_ms:
+        if pinch_edge and not drag_active and (t_ms - self._last_pinch_click_ms) >= self.config.pinch_click_cooldown_ms:
             events.append(ControlEvent(event_type=EventType.MOUSE_DOWN_LEFT))
             events.append(ControlEvent(event_type=EventType.MOUSE_UP_LEFT))
             self._last_pinch_click_ms = t_ms
